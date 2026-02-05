@@ -151,3 +151,10 @@ skyseg.onnx
 # data folders
 /inputs
 /outputs
+
+# container folders
+/examples
+/service
+/uploads
+/Tiancheng
+/tmp_vis_frontend

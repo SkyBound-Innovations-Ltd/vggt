@@ -1,0 +1,37 @@
+# VGGT-P Service Docker Image
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+# Set working directory
+WORKDIR /workspace
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy VGGT package and service files
+COPY vggt/ /workspace/vggt/
+COPY main.py /workspace/
+COPY main_v2_state_est.py /workspace/
+COPY main_v3_service.py /workspace/
+COPY requirements_service.txt /workspace/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements_service.txt
+
+# Pre-download VGGT model (optional, speeds up first request)
+RUN python -c "from vggt.models.vggt import VGGT; VGGT.from_pretrained('facebook/VGGT-1B')" || true
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run service
+CMD ["uvicorn", "main_v3_service:app", "--host", "0.0.0.0", "--port", "8000"]
