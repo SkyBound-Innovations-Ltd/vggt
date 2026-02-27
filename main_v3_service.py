@@ -54,6 +54,11 @@ class VGGTParameters(BaseModel):
     magnetic_declination: float = Field(default=0.0, description="Magnetic declination in degrees")
     add_drone_yaw: bool = Field(default=False, description="Add drone yaw to gimbal yaw")
     use_osd_yaw: bool = Field(default=False, description="Use OSD.yaw instead of GIMBAL.yaw")
+    timezone: str = Field(default="UTC", description="Timezone of flight log local timestamps (e.g., 'UTC', 'Europe/London')")
+    hdbscan_min_cluster_size: int = Field(default=5, description="HDBSCAN min_cluster_size: minimum person detections to form a crowd", ge=2)
+    hdbscan_min_samples: int = Field(default=3, description="HDBSCAN min_samples: higher = more conservative clustering", ge=1)
+    hdbscan_coherence_weight: float = Field(default=2.0, description="Weight on velocity features for crowd clustering", ge=0.0)
+    hdbscan_max_speed_mps: float = Field(default=2.0, description="Max walking speed (m/s) for velocity normalisation", gt=0.0)
 
 
 class VGGTRequest(BaseModel):
@@ -97,6 +102,25 @@ async def download_file(url: str, destination: Path) -> None:
         with open(destination, "wb") as f:
             f.write(response.content)
     logger.info(f"Downloaded {destination.name} ({destination.stat().st_size} bytes)")
+
+
+@router.get("/")
+async def root():
+    """Root endpoint - Service information and available endpoints."""
+    return {
+        "service": "VGGT-P Service",
+        "version": "1.0",
+        "description": "Full pipeline from video to geolocalized object tracks with state estimation",
+        "status": "online",
+        "model_loaded": MODEL is not None,
+        "endpoints": {
+            "GET /vggt_p/": "Service information (this page)",
+            "GET /vggt_p/health": "Health check endpoint",
+            "POST /vggt_p/process": "Process video via URLs (video, flight log, tracking JSON)",
+            "POST /vggt_p/process-upload": "Process video via file upload"
+        },
+        "documentation": "See /docs/VGGT_P_API.md for detailed API documentation"
+    }
 
 
 @router.get("/health")
@@ -165,7 +189,12 @@ async def process_video(request: VGGTRequest):
                 yaw_offset=request.parameters.yaw_offset,
                 magnetic_declination=request.parameters.magnetic_declination,
                 add_drone_yaw=request.parameters.add_drone_yaw,
-                use_osd_yaw=request.parameters.use_osd_yaw
+                use_osd_yaw=request.parameters.use_osd_yaw,
+                timezone=request.parameters.timezone,
+                hdbscan_min_cluster_size=request.parameters.hdbscan_min_cluster_size,
+                hdbscan_min_samples=request.parameters.hdbscan_min_samples,
+                hdbscan_coherence_weight=request.parameters.hdbscan_coherence_weight,
+                hdbscan_max_speed_mps=request.parameters.hdbscan_max_speed_mps,
             )
 
             # Return JSON response
@@ -192,7 +221,13 @@ async def process_video_upload(
     yaw_offset: float = Form(0.0),
     magnetic_declination: float = Form(0.0),
     add_drone_yaw: bool = Form(False),
-    use_osd_yaw: bool = Form(False)
+    use_osd_yaw: bool = Form(False),
+    timezone: str = Form("UTC"),
+    # Crowd clustering (HDBSCAN) parameters
+    hdbscan_min_cluster_size: int = Form(5),
+    hdbscan_min_samples: int = Form(3),
+    hdbscan_coherence_weight: float = Form(2.0),
+    hdbscan_max_speed_mps: float = Form(2.0),
 ):
     """
     Process video through full VGGT + state estimation pipeline (file upload version).
@@ -250,7 +285,12 @@ async def process_video_upload(
                 yaw_offset=yaw_offset,
                 magnetic_declination=magnetic_declination,
                 add_drone_yaw=add_drone_yaw,
-                use_osd_yaw=use_osd_yaw
+                use_osd_yaw=use_osd_yaw,
+                timezone=timezone,
+                hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+                hdbscan_min_samples=hdbscan_min_samples,
+                hdbscan_coherence_weight=hdbscan_coherence_weight,
+                hdbscan_max_speed_mps=hdbscan_max_speed_mps,
             )
 
             # Return JSON response
@@ -385,7 +425,12 @@ def run_state_estimation(
     yaw_offset: float,
     magnetic_declination: float,
     add_drone_yaw: bool,
-    use_osd_yaw: bool
+    use_osd_yaw: bool,
+    timezone: str = "UTC",
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: int = 3,
+    hdbscan_coherence_weight: float = 2.0,
+    hdbscan_max_speed_mps: float = 2.0,
 ) -> Dict:
     """Run state estimation and return JSON result."""
     import pandas as pd
@@ -403,7 +448,7 @@ def run_state_estimation(
         raise ValueError("No tracks found in tracking JSON")
 
     # Load flight record
-    flight_data, home_position = load_flight_record(flight_log_path)
+    flight_data, home_position = load_flight_record(flight_log_path, timezone=timezone)
 
     # Load intrinsics
     intrinsics = np.load(intrinsics_path)
@@ -415,17 +460,6 @@ def run_state_estimation(
 
     first_depth = np.load(depth_files[0])
     depth_res = first_depth.shape  # (H, W)
-
-    # Get number of depth frames
-    num_depth_frames = len(depth_files)
-
-    # Resample flight data to match depth frame count
-    # flight_data has all telemetry (e.g., 450 rows), but we only have 225 depth frames
-    if len(flight_data) != num_depth_frames:
-        logger.info(f"Resampling flight data: {len(flight_data)} entries -> {num_depth_frames} frames")
-        indices = np.linspace(0, len(flight_data) - 1, num_depth_frames, dtype=int)
-        flight_data = flight_data.iloc[indices].reset_index(drop=True)
-        logger.info(f"Resampled flight data: {len(flight_data)} entries")
 
     logger.info(f"Processing {len(tracks)} tracks")
     logger.info(f"Source resolution: {source_res}, Depth resolution: {depth_res}")
@@ -448,7 +482,11 @@ def run_state_estimation(
         yaw_offset_deg=yaw_offset,
         magnetic_declination_deg=magnetic_declination,
         add_drone_yaw=add_drone_yaw,
-        use_osd_yaw=use_osd_yaw
+        use_osd_yaw=use_osd_yaw,
+        hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+        hdbscan_min_samples=hdbscan_min_samples,
+        hdbscan_coherence_weight=hdbscan_coherence_weight,
+        hdbscan_max_speed_mps=hdbscan_max_speed_mps,
     )
 
     logger.info(f"Processed {len(processed_tracks)} track entries")
@@ -470,6 +508,13 @@ def run_state_estimation(
                 "sigma_a": kf_sigma_a,
                 "sigma_meas_h": kf_sigma_meas_h,
                 "sigma_meas_v": kf_sigma_meas_v
+            },
+            "crowd_clustering": {
+                "method": "HDBSCAN",
+                "min_cluster_size": hdbscan_min_cluster_size,
+                "min_samples": hdbscan_min_samples,
+                "coherence_weight": hdbscan_coherence_weight,
+                "max_speed_mps": hdbscan_max_speed_mps
             }
         },
         "tracks": processed_tracks

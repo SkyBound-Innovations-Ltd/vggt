@@ -13,14 +13,15 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
-def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps: float) -> dict:
+def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps: float,
+                            use_osd_yaw: bool = False) -> dict:
     """
     Parse DJI flight record CSV and extract telemetry synchronized with video frames.
 
     The function:
     1. Reads the CSV file
     2. Filters rows where CAMERA.isVideo is TRUE (video recording active)
-    3. Extracts altitude (AGL) and gimbal pitch angle
+    3. Extracts altitude (AGL), gimbal pitch angle, and yaw angle
     4. Resamples to match the target frame count for the video
 
     Note: Only gimbal pitch is used for metric scaling (not drone pitch),
@@ -31,12 +32,14 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
         csv_path: Path to DJI flight record CSV file
         video_duration_sec: Duration of the input video in seconds
         target_fps: Target frames per second for extraction
+        use_osd_yaw: If True, use OSD.yaw (drone heading) instead of GIMBAL.yaw
 
     Returns:
         dict with keys, or None if gimbal data is invalid:
             - 'altitudes': List of altitude values (meters) per frame
             - 'pitch_gimbal': List of gimbal pitch angles (degrees, DJI convention) per frame
             - 'pitch_below_horizontal': List of pitch angles below horizontal (0=horizon, 90=nadir) per frame
+            - 'yaw': List of yaw angles (degrees) per frame
             - 'timestamps': List of timestamps per frame
     """
     import pandas as pd
@@ -58,10 +61,19 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
 
     print(f"  Using altitude column: {altitude_col}")
 
+    # Determine yaw column based on use_osd_yaw flag
+    if use_osd_yaw:
+        yaw_col = 'OSD.yaw'
+        print(f"  Using yaw column: OSD.yaw (drone heading)")
+    else:
+        yaw_col = 'GIMBAL.yaw'
+        print(f"  Using yaw column: GIMBAL.yaw (gimbal heading)")
+
     # Required columns
     required_cols = {
         'altitude': altitude_col,
         'pitch_gimbal': 'GIMBAL.pitch',
+        'yaw': yaw_col,
         'is_video': 'CAMERA.isVideo',
         'timestamp': 'CUSTOM.updateTime [local]'
     }
@@ -87,6 +99,7 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
     # Extract telemetry from video segment
     altitudes_raw = video_df[required_cols['altitude']].values
     pitch_gimbal_raw = video_df[required_cols['pitch_gimbal']].values
+    yaw_raw = video_df[required_cols['yaw']].values
     timestamps_raw = video_df[required_cols['timestamp']].values
 
     # Check if gimbal pitch data is valid (not all zeros)
@@ -98,6 +111,7 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
     # Handle NaN values
     altitudes_raw = np.nan_to_num(altitudes_raw, nan=np.nanmean(altitudes_raw))
     pitch_gimbal_raw = np.nan_to_num(pitch_gimbal_raw, nan=0.0)
+    yaw_raw = np.nan_to_num(yaw_raw, nan=0.0)
 
     # Calculate target frame count
     target_frame_count = int(video_duration_sec * target_fps)
@@ -113,6 +127,7 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
 
         altitudes = np.interp(new_indices, old_indices, altitudes_raw)
         pitch_gimbal = np.interp(new_indices, old_indices, pitch_gimbal_raw)
+        yaw = np.interp(new_indices, old_indices, yaw_raw)
 
         # For timestamps, sample at indices
         timestamp_indices = np.linspace(0, len(timestamps_raw) - 1, target_frame_count).astype(int)
@@ -122,6 +137,7 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
     else:
         altitudes = altitudes_raw
         pitch_gimbal = pitch_gimbal_raw
+        yaw = yaw_raw
         timestamps = list(timestamps_raw)
 
     # Convert gimbal pitch to "pitch below horizontal" for scale_depth_to_metric
@@ -137,11 +153,13 @@ def parse_dji_flight_record(csv_path: str, video_duration_sec: float, target_fps
     print(f"  Altitude range: [{altitudes.min():.1f}, {altitudes.max():.1f}] m (mean: {altitudes.mean():.1f} m)")
     print(f"  Gimbal pitch range: [{pitch_gimbal.min():.1f}, {pitch_gimbal.max():.1f}]° (DJI convention)")
     print(f"  Pitch below horizontal: [{pitch_below_horizontal.min():.1f}, {pitch_below_horizontal.max():.1f}]°")
+    print(f"  Yaw range: [{yaw.min():.1f}, {yaw.max():.1f}]°")
 
     return {
         'altitudes': list(altitudes),
         'pitch_gimbal': list(pitch_gimbal),
         'pitch_below_horizontal': list(pitch_below_horizontal),
+        'yaw': list(yaw),
         'timestamps': timestamps
     }
 
@@ -333,20 +351,25 @@ def extract_frames_from_video(video_path, fps=1):
     video_duration = total_frames / video_fps if video_fps > 0 else 0
 
     # Calculate how many frames we want to extract based on desired fps and duration
-    # This ensures output duration matches input duration
     target_frame_count = int(video_duration * fps)
-    frame_interval = max(1, total_frames // target_frame_count) if target_frame_count > 0 else 1
+
+    # Use floating-point frame selection for accurate sampling
+    # This ensures we extract exactly target_frame_count frames regardless of fps ratio
+    if target_frame_count > 0 and total_frames > 0:
+        frame_indices = set(np.linspace(0, total_frames - 1, target_frame_count).astype(int))
+    else:
+        frame_indices = set()
 
     print(f"Video FPS: {video_fps}, Total frames: {total_frames}, Duration: {video_duration:.1f}s")
-    print(f"Target: {fps} fps → extracting ~{target_frame_count} frames (1 every {frame_interval} frames)")
-    print(f"Output video will be: {target_frame_count / fps:.1f}s at {fps} fps")
+    print(f"Target: {fps} fps → extracting {len(frame_indices)} frames")
+    print(f"Output video will be: {len(frame_indices) / fps:.1f}s at {fps} fps")
 
     frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if frame_idx % frame_interval == 0:
+        if frame_idx in frame_indices:
             # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(frame_rgb)
@@ -555,71 +578,120 @@ def extract_center_depths(depth_maps):
     return center_depths
 
 
-def create_live_plot_frame(time_values, depth_values, current_idx, total_time,
-                           target_height, target_width, y_min=None, y_max=None):
+def create_live_plot_frame(time_values, canonical_depths, metric_depths, current_idx, total_time,
+                           target_height, target_width,
+                           canonical_range=None, metric_range=None):
     """
     Create a live 2D plot frame showing accumulated center depth values over time.
+    Features dual y-axes: left for canonical depth, right for metric depth.
 
     Args:
         time_values: List of time values (x-axis)
-        depth_values: List of depth values (y-axis)
+        canonical_depths: List of canonical depth values (left y-axis)
+        metric_depths: List of metric depth values (right y-axis), or None
         current_idx: Current frame index (plot up to this point)
         total_time: Total video duration in seconds (fixed x-axis limit)
         target_height: Target height for the output image
         target_width: Target width for the output image
-        y_min: Optional fixed y-axis minimum
-        y_max: Optional fixed y-axis maximum
+        canonical_range: (min, max) for canonical depth y-axis
+        metric_range: (min, max) for metric depth y-axis
 
     Returns:
         numpy array of the plot image [H, W, 3]
     """
     # Create figure with dark theme
-    fig, ax = plt.subplots(figsize=(target_width / 100, target_height / 100), dpi=100)
+    fig, ax1 = plt.subplots(figsize=(target_width / 100, target_height / 100), dpi=100)
     fig.patch.set_facecolor('#1a1a1a')
-    ax.set_facecolor('#1a1a1a')
+    ax1.set_facecolor('#1a1a1a')
 
     # Plot accumulated data up to current frame
     plot_times = time_values[:current_idx + 1]
-    plot_depths = depth_values[:current_idx + 1]
+    plot_canonical = canonical_depths[:current_idx + 1]
 
-    # Plot line with gradient effect
+    # Colors for dual axes
+    color_canonical = '#00ff88'  # Green for canonical
+    color_metric = '#ff8800'     # Orange for metric
+
+    # Left y-axis: Canonical depth
     if len(plot_times) > 1:
-        ax.plot(plot_times, plot_depths, color='#00ff88', linewidth=2, alpha=0.9)
+        ax1.plot(plot_times, plot_canonical, color=color_canonical, linewidth=2, alpha=0.9, label='Canonical')
 
-    # Mark current point
+    # Mark current point on canonical
     if len(plot_times) > 0:
-        ax.scatter([plot_times[-1]], [plot_depths[-1]], color='#ff4444', s=80, zorder=5)
+        ax1.scatter([plot_times[-1]], [plot_canonical[-1]], color=color_canonical, s=60, zorder=5, edgecolors='white', linewidths=1)
 
     # Fixed x-axis limit
-    ax.set_xlim(0, total_time)
+    ax1.set_xlim(0, total_time)
 
-    # Y-axis limits (use provided or auto-calculate from all data)
-    if y_min is not None and y_max is not None:
-        ax.set_ylim(y_min, y_max)
+    # Left y-axis limits
+    if canonical_range:
+        c_min, c_max = canonical_range
+        margin = (c_max - c_min) * 0.1
+        ax1.set_ylim(c_min - margin, c_max + margin)
     else:
-        all_depths = np.array(depth_values)
-        margin = (all_depths.max() - all_depths.min()) * 0.1
-        ax.set_ylim(all_depths.min() - margin, all_depths.max() + margin)
+        all_canonical = np.array(canonical_depths)
+        margin = (all_canonical.max() - all_canonical.min()) * 0.1
+        ax1.set_ylim(all_canonical.min() - margin, all_canonical.max() + margin)
 
-    # Styling
-    ax.set_xlabel('Time (s)', color='white', fontsize=12)
-    ax.set_ylabel('Center Depth (canonical)', color='white', fontsize=12)
-    ax.set_title('Center Pixel Depth Over Time', color='white', fontsize=14, pad=10)
+    # Left y-axis styling
+    ax1.set_xlabel('Time (s)', color='white', fontsize=11)
+    ax1.set_ylabel('Canonical Depth', color=color_canonical, fontsize=11)
+    ax1.tick_params(axis='y', colors=color_canonical, labelsize=9)
+    ax1.tick_params(axis='x', colors='white', labelsize=9)
+    ax1.spines['bottom'].set_color('white')
+    ax1.spines['top'].set_color('#333333')
+    ax1.spines['left'].set_color(color_canonical)
+    ax1.grid(True, alpha=0.3, color='#444444')
 
-    ax.tick_params(colors='white', labelsize=10)
-    ax.spines['bottom'].set_color('white')
-    ax.spines['top'].set_color('#333333')
-    ax.spines['left'].set_color('white')
-    ax.spines['right'].set_color('#333333')
-    ax.grid(True, alpha=0.3, color='#444444')
+    # Right y-axis: Metric depth (if available)
+    if metric_depths is not None:
+        ax2 = ax1.twinx()
+        plot_metric = metric_depths[:current_idx + 1]
 
-    # Add current time annotation
-    if len(plot_times) > 0:
-        ax.annotate(f't={plot_times[-1]:.2f}s\nd={plot_depths[-1]:.3f}',
-                    xy=(plot_times[-1], plot_depths[-1]),
-                    xytext=(10, 10), textcoords='offset points',
-                    color='white', fontsize=10,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='#333333', alpha=0.8))
+        if len(plot_times) > 1:
+            ax2.plot(plot_times, plot_metric, color=color_metric, linewidth=2, alpha=0.9, linestyle='--', label='Metric')
+
+        # Mark current point on metric
+        if len(plot_times) > 0:
+            ax2.scatter([plot_times[-1]], [plot_metric[-1]], color=color_metric, s=60, zorder=5, edgecolors='white', linewidths=1)
+
+        # Right y-axis limits
+        if metric_range:
+            m_min, m_max = metric_range
+            margin = (m_max - m_min) * 0.1
+            ax2.set_ylim(m_min - margin, m_max + margin)
+        else:
+            all_metric = np.array(metric_depths)
+            margin = (all_metric.max() - all_metric.min()) * 0.1
+            ax2.set_ylim(all_metric.min() - margin, all_metric.max() + margin)
+
+        # Right y-axis styling
+        ax2.set_ylabel('Metric Depth (m)', color=color_metric, fontsize=11)
+        ax2.tick_params(axis='y', colors=color_metric, labelsize=9)
+        ax2.spines['right'].set_color(color_metric)
+        ax2.spines['left'].set_color(color_canonical)
+
+        # Title with both values
+        ax1.set_title('Center Depth: Canonical (green) vs Metric (orange)', color='white', fontsize=12, pad=8)
+
+        # Annotation with both values
+        if len(plot_times) > 0:
+            ax1.annotate(f't={plot_times[-1]:.2f}s\ncanon={plot_canonical[-1]:.3f}\nmetric={plot_metric[-1]:.1f}m',
+                        xy=(plot_times[-1], plot_canonical[-1]),
+                        xytext=(10, -40), textcoords='offset points',
+                        color='white', fontsize=9,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#333333', alpha=0.8))
+    else:
+        ax1.spines['right'].set_color('#333333')
+        ax1.set_title('Center Canonical Depth Over Time', color='white', fontsize=12, pad=8)
+
+        # Annotation with canonical only
+        if len(plot_times) > 0:
+            ax1.annotate(f't={plot_times[-1]:.2f}s\ncanon={plot_canonical[-1]:.3f}',
+                        xy=(plot_times[-1], plot_canonical[-1]),
+                        xytext=(10, 10), textcoords='offset points',
+                        color='white', fontsize=9,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#333333', alpha=0.8))
 
     plt.tight_layout()
 
@@ -636,14 +708,14 @@ def create_live_plot_frame(time_values, depth_values, current_idx, total_time,
 
 
 def create_quadrant_frame(rgb_frame, canonical_depth, metric_depth,
-                          time_values, center_depths, current_idx,
-                          total_time, colormap='turbo',
+                          time_values, canonical_center_depths, metric_center_depths,
+                          current_idx, total_time, colormap='turbo',
                           canonical_range=None, metric_range=None):
     """
     Create a quadrant video frame with:
     - Top-left: Input RGB
     - Top-right: Canonical depth (VGGT)
-    - Bottom-left: Live plot (time vs center depth)
+    - Bottom-left: Live plot with dual y-axes (canonical & metric depth)
     - Bottom-right: Metric depth
 
     Args:
@@ -651,7 +723,8 @@ def create_quadrant_frame(rgb_frame, canonical_depth, metric_depth,
         canonical_depth: Canonical depth map from VGGT [H, W]
         metric_depth: Metric depth map in meters [H, W] (or None)
         time_values: List of all time values
-        center_depths: List of all center depth values
+        canonical_center_depths: List of canonical center depth values
+        metric_center_depths: List of metric center depth values (or None)
         current_idx: Current frame index
         total_time: Total video duration
         colormap: Matplotlib colormap name
@@ -709,10 +782,15 @@ def create_quadrant_frame(rgb_frame, canonical_depth, metric_depth,
         mask = (metric_cb > 0).any(axis=2)
         roi[mask] = (alpha * metric_cb[mask] + (1 - alpha) * roi[mask]).astype(np.uint8)
 
-    # Create live plot
+    # Create live plot with dual y-axes
+    # Calculate center depth ranges for consistent y-axis limits
+    canonical_center_range = (min(canonical_center_depths), max(canonical_center_depths)) if canonical_center_depths else None
+    metric_center_range = (min(metric_center_depths), max(metric_center_depths)) if metric_center_depths else None
+
     plot_frame = create_live_plot_frame(
-        time_values, center_depths, current_idx, total_time,
-        target_height=h, target_width=w
+        time_values, canonical_center_depths, metric_center_depths, current_idx, total_time,
+        target_height=h, target_width=w,
+        canonical_range=canonical_center_range, metric_range=metric_center_range
     )
 
     # Add labels
@@ -759,9 +837,10 @@ def encode_quadrant_video(frames, canonical_depths, metric_depths, output_path,
     if len(frames) == 0 or len(canonical_depths) == 0:
         raise ValueError("No frames or depth maps to encode")
 
-    # Extract center depths from canonical depth maps
+    # Extract center depths from both canonical and metric depth maps
     print("  Extracting center pixel depths...")
-    center_depths = extract_center_depths(canonical_depths)
+    canonical_center_depths = extract_center_depths(canonical_depths)
+    metric_center_depths = extract_center_depths(metric_depths) if metric_depths is not None else None
 
     # Calculate time values
     total_time = len(frames) / fps
@@ -784,7 +863,7 @@ def encode_quadrant_video(frames, canonical_depths, metric_depths, output_path,
 
     first_frame = create_quadrant_frame(
         frames[0], first_canonical, first_metric,
-        time_values, center_depths, 0, total_time,
+        time_values, canonical_center_depths, metric_center_depths, 0, total_time,
         colormap, canonical_range, metric_range
     )
     h, w = first_frame.shape[:2]
@@ -826,7 +905,7 @@ def encode_quadrant_video(frames, canonical_depths, metric_depths, output_path,
 
             quadrant = create_quadrant_frame(
                 frames[i], canonical, metric,
-                time_values, center_depths, i, total_time,
+                time_values, canonical_center_depths, metric_center_depths, i, total_time,
                 colormap, canonical_range, metric_range
             )
 
@@ -861,7 +940,7 @@ def encode_quadrant_video(frames, canonical_depths, metric_depths, output_path,
 
             quadrant = create_quadrant_frame(
                 frames[i], canonical, metric,
-                time_values, center_depths, i, total_time,
+                time_values, canonical_center_depths, metric_center_depths, i, total_time,
                 colormap, canonical_range, metric_range
             )
 
@@ -1032,6 +1111,8 @@ def main():
                         help="Colormap for depth visualization (default: turbo)")
     parser.add_argument("--quadrant-video", action="store_true",
                         help="Save quadrant analysis video (RGB, canonical depth, live plot, metric depth)")
+    parser.add_argument("--use-osd-yaw", action="store_true",
+                        help="Use OSD.yaw (drone heading) instead of GIMBAL.yaw for yaw angle")
     args = parser.parse_args()
 
     # Start total timer
@@ -1144,7 +1225,8 @@ def main():
         telemetry = parse_dji_flight_record(
             args.flight_record,
             video_duration_sec=video_duration,
-            target_fps=args.fps
+            target_fps=args.fps,
+            use_osd_yaw=args.use_osd_yaw
         )
 
         # Check if telemetry is valid (gimbal data was logged)

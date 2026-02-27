@@ -11,6 +11,7 @@ This document describes the differences between the five `main_*.py` files in th
 | `main_v2_state_est.py` | Object state estimation | Depth maps + Tracks + Telemetry | Geolocalized tracks JSON | ~1980 |
 | `main_v3_service.py` | FastAPI service (production) | Video + Flight log + Tracks (via API) | Geolocalized tracks JSON | ~488 |
 | `main_v4_no_flight.py` | State estimation without flight log | Video + Tracks | State JSON (VGGT coords) + 2D map | ~680 |
+| `main_v5_global_scale.py` | Long video batch processing with scale stitching | Video + Flight log | Depth maps, metric depth, video | ~1264 |
 
 ---
 
@@ -244,6 +245,74 @@ python main_v4_no_flight.py \
 
 ---
 
+### 6. `main_v5_global_scale.py` - Long Video Batch Processing
+
+**Purpose:** Process long videos that would cause OOM errors by splitting into overlapping segments with scale-consistent depth stitching.
+
+**Key Features:**
+- **Segment-based processing** - Splits video into fixed-size segments (default: 250 frames)
+- **Overlap-based scale alignment** - Uses overlapping frames to align depth scales between segments
+- **Global scale factor** - Computes metric scale from first N reference frames
+- **Memory efficient** - Clears GPU cache after each segment
+- **Quadrant analysis video** - RGB, canonical depth, live plot, metric depth
+
+**The OOM Problem:**
+VGGT processes all frames together for temporal consistency, but this requires O(N²) memory for attention.
+For long videos (1000+ frames), this exceeds GPU memory.
+
+**The Scale Stitching Solution:**
+VGGT initializes depth scale arbitrarily per inference, so consecutive segments may have different absolute scales.
+This function aligns each segment to the previous one using overlapping frames:
+
+```
+Segment 0: [0, 250)     → global_scale = 1.0
+Segment 1: [240, 490)   → lambda = median(seg0[-10:] / seg1[:10])
+                        → global_scale *= lambda
+                        → seg1_depth *= global_scale
+Segment 2: [480, 730)   → lambda = median(seg1[-10:] / seg2[:10])
+                        → global_scale *= lambda
+                        → seg2_depth *= global_scale
+...
+```
+
+**De-duplication:**
+- Segment 0: keep all frames [0, 250)
+- Segment k > 0: drop first `overlap_frames` (already stored from previous segment)
+
+**CLI Usage:**
+```bash
+python main_v5_global_scale.py \
+  -i long_video.mp4 \
+  -f flight_record.csv \
+  -o outputs/ \
+  --fps 10 \
+  --segment-size 250 \
+  --overlap-frames 10 \
+  --num-reference-frames 10
+```
+
+**Key Arguments:**
+- `--segment-size` - Frames per inference segment (default: 250, reduce if OOM)
+- `--overlap-frames` - Overlapping frames for scale alignment (default: 10)
+- `--num-reference-frames` - Frames for global metric scale computation (default: 10)
+- `--quadrant-video` - Generate 4-panel analysis video
+
+**Output Files:**
+- `depth/depth_XXXX.npy` - Canonical depth maps (scale-aligned)
+- `depth_metric/depth_metric_XXXX.npy` - Metric depth maps
+- `depth_metric/global_scale_factor.npy` - Scale factor info
+- `depth_video.mp4` - Side-by-side visualization
+- `quadrant_analysis.mp4` - 4-panel analysis (optional)
+
+**Memory Usage Example:**
+| Video Length | Without Segments | With Segments (250) |
+|--------------|------------------|---------------------|
+| 300 frames   | ~16 GB           | ~8 GB               |
+| 600 frames   | OOM              | ~8 GB               |
+| 1800 frames  | OOM              | ~8 GB               |
+
+---
+
 ## Evolution Flow
 
 ```
@@ -254,12 +323,17 @@ main.py (basic depth)
     │       └── [Depth maps output]
     │                │
     │                ▼
-    └──────► main_v2_state_est.py (state estimation)
-                    │
-                    ├──────────────────────────┐
-                    ▼                          ▼
-            main_v3_service.py          main_v4_no_flight.py
-            (API with flight log)       (CLI without flight log)
+    ├──────► main_v2_state_est.py (state estimation)
+    │               │
+    │               ├──────────────────────────┐
+    │               ▼                          ▼
+    │       main_v3_service.py          main_v4_no_flight.py
+    │       (API with flight log)       (CLI without flight log)
+    │
+    └── main_v5_global_scale.py (long video batch processing)
+            - Segment-based inference
+            - Overlap scale alignment
+            - Global metric scale factor
 ```
 
 ---
@@ -273,6 +347,8 @@ main.py (basic depth)
 | Already have depth maps, need object positions | `main_v2_state_est.py` |
 | Production API deployment (with flight log) | `main_v3_service.py` |
 | **No flight log available** | `main_v4_no_flight.py` |
+| **Long video (OOM issues)** | `main_v5_global_scale.py` |
+| **Consistent depth scale across long video** | `main_v5_global_scale.py` |
 | Debugging/development | Individual scripts |
 | Backend integration (with GPS) | `main_v3_service.py` |
 | Backend integration (no GPS) | `main_v4_no_flight.py` |
@@ -290,6 +366,11 @@ main.py (basic depth)
   - Contains own Kalman Filter (derived from `main_v2_state_est.py`)
   - Uses VGGT coordinate system instead of NED/LLA
 
+- `main_v5_global_scale.py` is standalone:
+  - Contains `process_video_in_segments()` for batch processing with overlap scale alignment
+  - Contains own metric scaling with global scale factor
+  - Derived from `main.py` with segment-based processing
+
 - `main_v2_state_est.py` is standalone (no imports from other main files)
 
 - `main_v1_robust.py` is standalone (independent implementation)
@@ -305,3 +386,4 @@ main.py (basic depth)
 | main_v2_state_est.py | v2 | State estimation with Kalman Filter, object geolocalization |
 | main_v3_service.py | v3 | FastAPI service wrapper for production deployment |
 | main_v4_no_flight.py | v4 | State estimation without flight log, VGGT coordinate system |
+| main_v5_global_scale.py | v5 | Segment-based batch processing with overlap scale alignment for long videos |

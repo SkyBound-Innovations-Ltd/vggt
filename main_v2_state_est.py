@@ -308,10 +308,16 @@ def parse_args():
         action="store_true",
         help="Use OSD.yaw (drone heading) instead of GIMBAL.yaw for yaw angle"
     )
+    parser.add_argument(
+        "--timezone",
+        type=str,
+        default="UTC",
+        help="Timezone for flight log local timestamps (e.g., 'UTC', 'Europe/London'). Default: UTC"
+    )
     return parser.parse_args()
 
 
-def load_flight_record(csv_path: str) -> Tuple[pd.DataFrame, Tuple[float, float, float]]:
+def load_flight_record(csv_path: str, timezone: str = "UTC") -> Tuple[pd.DataFrame, Tuple[float, float, float]]:
     """
     Load and parse DJI flight record CSV.
 
@@ -362,6 +368,8 @@ def load_flight_record(csv_path: str) -> Tuple[pd.DataFrame, Tuple[float, float,
     xspeed_cols = ['OSD.xSpeed']  # North velocity (NED)
     yspeed_cols = ['OSD.ySpeed']  # East velocity (NED)
     zspeed_cols = ['OSD.zSpeed']  # Down velocity (NED)
+    custom_date_cols = ['CUSTOM.date']  # Will match "CUSTOM.date [local]"
+    custom_time_cols = ['CUSTOM.updateTime']  # Will match "CUSTOM.updateTime [local]"
 
     col_mapping['latitude'] = find_col(lat_cols, df_cols)
     col_mapping['longitude'] = find_col(lon_cols, df_cols)
@@ -381,6 +389,8 @@ def load_flight_record(csv_path: str) -> Tuple[pd.DataFrame, Tuple[float, float,
     col_mapping['xspeed'] = find_col(xspeed_cols, df_cols)
     col_mapping['yspeed'] = find_col(yspeed_cols, df_cols)
     col_mapping['zspeed'] = find_col(zspeed_cols, df_cols)
+    col_mapping['custom_date'] = find_col(custom_date_cols, df_cols)
+    col_mapping['custom_time'] = find_col(custom_time_cols, df_cols)
 
     print(f"  Column mapping: {col_mapping}")
 
@@ -567,6 +577,25 @@ def load_flight_record(csv_path: str) -> Tuple[pd.DataFrame, Tuple[float, float,
     result['vel_north'] = result['vel_north'].fillna(0)
     result['vel_east'] = result['vel_east'].fillna(0)
     result['vel_down'] = result['vel_down'].fillna(0)
+
+    # Parse CUSTOM.date + CUSTOM.updateTime into TIMESTAMPTZ
+    if col_mapping['custom_date'] is not None and col_mapping['custom_time'] is not None:
+        from zoneinfo import ZoneInfo
+        date_col = col_mapping['custom_date']
+        time_col = col_mapping['custom_time']
+        # Get the raw date/time strings from the filtered df (aligned with result index)
+        date_strs = df[date_col].reset_index(drop=True).iloc[:len(result)]
+        time_strs = df[time_col].reset_index(drop=True).iloc[:len(result)]
+        # Combine and parse: "1/20/2026 11:36:09.73 AM"
+        datetime_strs = date_strs.astype(str) + ' ' + time_strs.astype(str)
+        result['timestamp'] = pd.to_datetime(datetime_strs, format='mixed', dayfirst=False)
+        # Localize to specified timezone
+        tz = ZoneInfo(timezone)
+        result['timestamp'] = result['timestamp'].dt.tz_localize(tz)
+        print(f"    timestamp: {result['timestamp'].iloc[0]} -> {result['timestamp'].iloc[-1]} ({timezone})")
+    else:
+        print("    Warning: CUSTOM.date/updateTime columns not found, timestamp will be unavailable")
+        result['timestamp'] = pd.NaT
 
     print(f"  Loaded {len(result)} valid telemetry records (dropped {before_count - len(result)} with missing lat/lon/alt)")
 
@@ -1093,6 +1122,157 @@ def estimate_velocity(
     return results
 
 
+def _get_telemetry_row(frame_id: int, fps: float, flight_data: pd.DataFrame) -> pd.Series:
+    """
+    Get the telemetry row corresponding to a given extracted video frame_id.
+
+    Uses timestamp-based nearest-neighbour lookup when timestamps are available
+    (most accurate), otherwise falls back to clamped direct index access.
+
+    Args:
+        frame_id: 0-based index of the extracted video frame (from DET-TRACK)
+        fps: extraction fps used when the video was sampled
+        flight_data: telemetry DataFrame (may have any number of rows / any sample rate)
+
+    Returns:
+        The telemetry row (pd.Series) that best matches the frame's capture time
+    """
+    if 'timestamp' in flight_data.columns and flight_data['timestamp'].notna().any():
+        video_start = flight_data['timestamp'].iloc[0]
+        frame_time = video_start + pd.Timedelta(seconds=frame_id / fps)
+        time_diffs = (flight_data['timestamp'] - frame_time).abs()
+        closest_idx = int(time_diffs.argmin())
+        return flight_data.iloc[closest_idx]
+    else:
+        # Fallback: clamp to valid range (avoids out-of-bounds without resampling)
+        idx = min(frame_id, len(flight_data) - 1)
+        return flight_data.iloc[idx]
+
+
+def _compute_cluster_area(positions_2d: np.ndarray, min_area_m2: float = 1.0) -> float:
+    """
+    Compute the area occupied by a cluster of people in the NE plane.
+
+    Uses convex hull area for 3+ non-collinear points, with fallback
+    handling for degenerate cases.
+
+    Args:
+        positions_2d: (n, 2) array of [North, East] positions in metres.
+        min_area_m2: Minimum area in m^2 to return (prevents infinite density).
+
+    Returns:
+        Area in square metres (at least min_area_m2).
+    """
+    from scipy.spatial import ConvexHull
+
+    n = len(positions_2d)
+    if n <= 1:
+        return min_area_m2
+
+    if n == 2:
+        dist = np.linalg.norm(positions_2d[0] - positions_2d[1])
+        area = np.pi * (dist / 2) ** 2
+        return max(area, min_area_m2)
+
+    try:
+        hull = ConvexHull(positions_2d)
+        return max(hull.volume, min_area_m2)  # .volume is area in 2D
+    except Exception:
+        # Degenerate: collinear or coincident points — use bounding circle
+        centroid = positions_2d.mean(axis=0)
+        max_radius = np.max(np.linalg.norm(positions_2d - centroid, axis=1))
+        area = np.pi * max_radius ** 2
+        return max(area, min_area_m2)
+
+
+def cluster_crowds_per_frame(
+    processed_tracks: List[Dict],
+    min_cluster_size: int = 5,
+    min_samples: int = 3,
+    coherence_weight: float = 2.0,
+    max_walking_speed_mps: float = 2.0,
+) -> None:
+    """
+    Apply HDBSCAN clustering to person detections on a per-frame basis.
+
+    Mutates processed_tracks in-place, adding:
+      - 'crowd_id': int (1-based) or None (noise / non-person)
+      - 'crowd_density': float (people/m^2 within cluster convex hull) or None
+
+    Args:
+        processed_tracks: List of track dicts (mutated in-place).
+        min_cluster_size: HDBSCAN min_cluster_size parameter.
+        min_samples: HDBSCAN min_samples parameter.
+        coherence_weight: Multiplier on velocity features.
+        max_walking_speed_mps: Max expected walking speed for velocity normalisation.
+    """
+    from sklearn.cluster import HDBSCAN
+    from collections import defaultdict
+
+    # Initialise all tracks with null crowd fields
+    for track in processed_tracks:
+        track['crowd_id'] = None
+        track['crowd_density'] = None
+
+    # Group person detections by frame_id (store indices into processed_tracks)
+    persons_by_frame = defaultdict(list)
+    for i, track in enumerate(processed_tracks):
+        if track.get('class_name') == 'person':
+            persons_by_frame[track['frame_id']].append(i)
+
+    for frame_id, indices in persons_by_frame.items():
+        n_persons = len(indices)
+        if n_persons < min_cluster_size:
+            continue
+
+        # Extract 4D features: [pos_N, pos_E, vel_N, vel_E]
+        positions = np.array([processed_tracks[i]['pos_ned'][:2] for i in indices])
+        velocities = np.array([
+            processed_tracks[i].get('vel_ned', [0, 0, 0])[:2] for i in indices
+        ])
+
+        # Scale positions: zero-centre and range-normalise
+        pos_min = positions.min(axis=0)
+        pos_max = positions.max(axis=0)
+        pos_range = pos_max - pos_min
+        pos_range = np.where(pos_range < 1e-6, 1.0, pos_range)
+        pos_scaled = (positions - pos_min) / pos_range
+
+        # Scale velocities: normalise by max walking speed, then weight
+        vel_scaled = (velocities / max_walking_speed_mps) * coherence_weight
+
+        features = np.hstack([pos_scaled, vel_scaled])
+
+        # Run HDBSCAN
+        clusterer = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric='euclidean',
+        )
+        labels = clusterer.fit_predict(features)
+
+        # Group by cluster label for density calculation
+        clusters = defaultdict(list)
+        for local_idx, label in enumerate(labels):
+            if label >= 0:
+                clusters[int(label)].append(local_idx)
+
+        # Compute convex hull area per cluster
+        cluster_density = {}
+        for label, member_local_indices in clusters.items():
+            cluster_positions = positions[member_local_indices]
+            n_members = len(member_local_indices)
+            area = _compute_cluster_area(cluster_positions)
+            cluster_density[label] = round(n_members / area, 4) if area > 0 else None
+
+        # Assign crowd_id (1-based) and crowd_density
+        for local_idx, global_idx in enumerate(indices):
+            label = int(labels[local_idx])
+            if label >= 0:
+                processed_tracks[global_idx]['crowd_id'] = label + 1
+                processed_tracks[global_idx]['crowd_density'] = cluster_density.get(label)
+
+
 def process_tracks(
     tracks: List[Dict],
     flight_data: pd.DataFrame,
@@ -1110,7 +1290,11 @@ def process_tracks(
     yaw_offset_deg: float = 0.0,
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
-    use_osd_yaw: bool = False
+    use_osd_yaw: bool = False,
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: int = 3,
+    hdbscan_coherence_weight: float = 2.0,
+    hdbscan_max_speed_mps: float = 2.0,
 ) -> List[Dict]:
     """
     Process all tracks and estimate their states.
@@ -1136,6 +1320,13 @@ def process_tracks(
     source_w, source_h = source_res
     depth_h, depth_w = depth_res
 
+    # Count actual extracted frames from depth maps (ground truth for frame count)
+    from pathlib import Path as _Path
+    depth_files = sorted(_Path(depth_dir).glob("depth_metric_*.npy"))
+    num_frames = len(depth_files)
+    print(f"Extracted video frames (depth maps): {num_frames}")
+    print(f"Telemetry rows (raw flight data): {len(flight_data)}")
+
     # Scale factors
     sx = depth_w / source_w
     sy = depth_h / source_h
@@ -1156,6 +1347,12 @@ def process_tracks(
     # Sort each group by frame_id
     for obj_id in tracks_by_id:
         tracks_by_id[obj_id].sort(key=lambda x: x['frame_id'])
+
+    # Build first-detection frame map for each object (first frame_id after sorting)
+    first_detect_frame_map = {
+        obj_id: obj_tracks[0]['frame_id']
+        for obj_id, obj_tracks in tracks_by_id.items()
+    }
 
     # Process each track
     processed_tracks = []
@@ -1178,7 +1375,7 @@ def process_tracks(
                     print(f"Warning: Frame {frame_id} exceeds telemetry data, skipping")
                     continue
 
-                telem = flight_data.iloc[frame_id]
+                telem = _get_telemetry_row(frame_id, fps, flight_data)
 
                 # Load depth map
                 depth_map = load_depth_map(depth_dir, frame_id)
@@ -1285,15 +1482,17 @@ def process_tracks(
 
                 # Calculate horizontal speed
                 speed_mps = float(np.sqrt(filtered_vel[0]**2 + filtered_vel[1]**2))
+                speed_mph = speed_mps * 2.23694  # Convert m/s to mph
 
                 # Create processed track with filtered state
                 track_processed = track
                 track_processed['lat'] = float(lat)
                 track_processed['lon'] = float(lon)
+                track_processed['alt'] = float(alt)
                 track_processed['depth_m'] = float(depth)
                 track_processed['pos_ned'] = filtered_pos.tolist()
                 track_processed['vel_ned'] = filtered_vel.tolist()
-                track_processed['speed_mps'] = speed_mps
+                track_processed['speed_mph'] = speed_mph
 
                 processed_tracks.append(track_processed)
 
@@ -1314,7 +1513,7 @@ def process_tracks(
                     print(f"Warning: Frame {frame_id} exceeds telemetry data, skipping")
                     continue
 
-                telem = flight_data.iloc[frame_id]
+                telem = _get_telemetry_row(frame_id, fps, flight_data)
 
                 # Load depth map
                 depth_map = load_depth_map(depth_dir, frame_id)
@@ -1389,6 +1588,7 @@ def process_tracks(
                 track_processed = track.copy()
                 track_processed['lat'] = float(lat)
                 track_processed['lon'] = float(lon)
+                track_processed['alt'] = float(alt)
                 track_processed['depth_m'] = float(depth)
                 track_processed['pos_ned'] = point_ned.tolist()
 
@@ -1405,28 +1605,27 @@ def process_tracks(
                         if track_idx < len(velocities):
                             vel, speed = velocities[track_idx]
                             track['vel_ned'] = vel.tolist()
-                            track['speed_mps'] = speed
+                            track['speed_mph'] = speed * 2.23694  # Convert m/s to mph
                             track_idx += 1
             else:
                 # No velocity available
                 for track in processed_tracks:
                     if track.get('track_id', track.get('id')) == obj_id:
                         track['vel_ned'] = [0.0, 0.0, 0.0]
-                        track['speed_mps'] = 0.0
+                        track['speed_mph'] = 0.0
 
-    # Add heading_deg for all tracks (North=0°, East=90°, clockwise)
+    # Add heading_deg for all tracks (North=0°, East=90°, West=-90°, South=±180°, clockwise)
     for track in processed_tracks:
         vel = track.get('vel_ned', [0.0, 0.0, 0.0])
         v_north, v_east, v_down = vel[0], vel[1], vel[2]
 
         # Calculate heading from velocity (atan2(East, North))
         # atan2(y, x) gives angle from x-axis, so atan2(East, North) gives angle from North
+        # Result is in range [-180, 180] degrees
         if abs(v_north) > 0.01 or abs(v_east) > 0.01:  # Threshold to avoid noise
             heading_rad = np.arctan2(v_east, v_north)
             heading_deg = float(np.degrees(heading_rad))
-            # Normalize to [0, 360)
-            if heading_deg < 0:
-                heading_deg += 360.0
+            # Keep in [-180, 180] range (no normalization needed, atan2 already gives this range)
         else:
             heading_deg = None  # No valid heading for stationary objects
 
@@ -1455,11 +1654,74 @@ def process_tracks(
 
         track['density'] = count
 
+    # HDBSCAN crowd clustering (person detections only)
+    print("Running HDBSCAN crowd clustering on person detections...")
+    try:
+        cluster_crowds_per_frame(
+            processed_tracks,
+            min_cluster_size=hdbscan_min_cluster_size,
+            min_samples=hdbscan_min_samples,
+            coherence_weight=hdbscan_coherence_weight,
+            max_walking_speed_mps=hdbscan_max_speed_mps,
+        )
+        n_clustered = sum(1 for t in processed_tracks if t.get('crowd_id') is not None)
+        unique_crowds = set(
+            (t['frame_id'], t['crowd_id'])
+            for t in processed_tracks if t.get('crowd_id') is not None
+        )
+        print(f"  Crowd clustering: {n_clustered} person-detections assigned to "
+              f"{len(unique_crowds)} frame-crowd groups")
+    except ImportError:
+        print("  Warning: sklearn HDBSCAN not available. Skipping crowd clustering.")
+        for track in processed_tracks:
+            track['crowd_id'] = None
+            track['crowd_density'] = None
+    except Exception as e:
+        print(f"  Warning: Crowd clustering failed: {e}. All crowd fields set to null.")
+        for track in processed_tracks:
+            track['crowd_id'] = None
+            track['crowd_density'] = None
+
+    # Reorder all tracks to have consistent field ordering with timestamp first
+    reordered_tracks = []
+    for track in processed_tracks:
+        frame_id = track.get('frame_id', 0)
+        # Get actual timestamp from flight data via timestamp-based lookup
+        telem_row = _get_telemetry_row(frame_id, fps, flight_data)
+        ts = telem_row.get('timestamp')
+        timestamp = ts.isoformat() if pd.notna(ts) else None
+
+        # Create properly ordered dictionary
+        tid = track.get('track_id')
+        ordered_track = {
+            'timestamp': timestamp,
+            'frame_id': track.get('frame_id'),
+            'track_id': tid,
+            'first_detect_frame': first_detect_frame_map.get(tid),
+            'bbox': track.get('bbox'),
+            'confidence': track.get('confidence'),
+            'class_name': track.get('class_name'),
+            'lat': track.get('lat'),
+            'lon': track.get('lon'),
+            'alt': track.get('alt'),
+            'depth_m': track.get('depth_m'),
+            'pos_ned': track.get('pos_ned'),
+            'vel_ned': track.get('vel_ned'),
+            'speed_mph': track.get('speed_mph'),
+            'heading_deg': track.get('heading_deg'),
+            'density': track.get('density'),
+            'crowd_id': track.get('crowd_id'),
+            'crowd_density': track.get('crowd_density'),
+        }
+        reordered_tracks.append(ordered_track)
+
+    processed_tracks = reordered_tracks
+
     # Create UAV state entries (track_id=0) for all frames
     print("Creating UAV state entries (track_id=0)...")
     uav_tracks = []
-    for frame_id in range(len(flight_data)):
-        telem = flight_data.iloc[frame_id]
+    for frame_id in range(num_frames):
+        telem = _get_telemetry_row(frame_id, fps, flight_data)
 
         # Get UAV position in NED
         uav_ned = lla_to_ned(
@@ -1489,32 +1751,40 @@ def process_tracks(
 
         # Calculate horizontal speed
         speed_mps = float(np.sqrt(vel_north**2 + vel_east**2))
+        speed_mph = speed_mps * 2.23694  # Convert m/s to mph
 
-        # Calculate UAV heading from velocity
-        if abs(vel_north) > 0.01 or abs(vel_east) > 0.01:
-            heading_rad = np.arctan2(vel_east, vel_north)
-            heading_deg = float(np.degrees(heading_rad))
-            if heading_deg < 0:
-                heading_deg += 360.0
+        # UAV heading: always use telemetry (toggle between GIMBAL.yaw and OSD.yaw based on use_osd_yaw parameter)
+        if use_osd_yaw:
+            heading_deg = float(telem.get('drone_yaw', 0.0))  # OSD.yaw
         else:
-            # Use drone yaw as fallback
-            heading_deg = float(telem.get('drone_yaw', 0.0))
+            heading_deg = float(telem.get('gimbal_yaw', 0.0))  # GIMBAL.yaw
+
+        # Get actual timestamp from flight data
+        if pd.notna(telem.get('timestamp')):
+            timestamp = telem['timestamp'].isoformat()
+        else:
+            timestamp = None
 
         # UAV track entry
         uav_track = {
+            'timestamp': timestamp,
             'frame_id': frame_id,
             'track_id': 0,  # Reserved for UAV
+            'first_detect_frame': None,
             'bbox': None,
             'confidence': None,
             'class_name': 'UAV',
             'lat': float(lat),
             'lon': float(lon),
+            'alt': float(alt),
             'depth_m': None,
             'pos_ned': uav_ned.tolist(),
             'vel_ned': vel_ned,
-            'speed_mps': speed_mps,
+            'speed_mph': speed_mph,
             'heading_deg': heading_deg,
-            'density': None  # Not applicable for UAV
+            'density': None,  # Not applicable for UAV
+            'crowd_id': None,
+            'crowd_density': None,
         }
 
         uav_tracks.append(uav_track)
@@ -1884,7 +2154,7 @@ def main():
     print("=" * 60)
 
     # Load data
-    flight_data, home_position = load_flight_record(args.flight_record)
+    flight_data, home_position = load_flight_record(args.flight_record, timezone=args.timezone)
     tracks = load_tracks(args.input_json)
     intrinsics = load_intrinsics(args.intrinsics)
 
@@ -1937,7 +2207,10 @@ def main():
                 elif key in ('lat', 'lon') and isinstance(value, float):
                     # 10 decimal places for lat/lon (~0.01mm precision)
                     f.write(f'    "{key}": {value:.10f}{comma}\n')
-                elif key in ('depth_m', 'speed_mps') and isinstance(value, float):
+                elif key in ('alt',) and isinstance(value, float):
+                    # 2 decimal places for altitude
+                    f.write(f'    "{key}": {value:.2f}{comma}\n')
+                elif key in ('depth_m', 'speed_mph') and isinstance(value, float):
                     # 4 decimal places for depth and speed
                     f.write(f'    "{key}": {value:.4f}{comma}\n')
                 elif key in ('heading_deg',) and isinstance(value, float):

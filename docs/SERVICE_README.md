@@ -48,14 +48,14 @@ pip install scipy
 ```bash
 ./start_service.sh
 # or
-uvicorn main_v3_service:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main_v3_service:app --host 0.0.0.0 --port 8003 --reload
 ```
 
-Service will run on: `http://localhost:8000`
+Service will run on: `http://localhost:8003`
 
 ### Production (with Uvicorn)
 ```bash
-uvicorn main_v3_service:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn main_v3_service:app --host 0.0.0.0 --port 8003 --workers 1
 ```
 
 **Note:** Use `--workers 1` because GPU model is loaded as a singleton.
@@ -69,7 +69,7 @@ docker build -f Dockerfile.vggt-service -t vggt-service:latest .
 docker run -d \
   --name vggt-service \
   --gpus all \
-  -p 8011:8000 \
+  -p 8003:8003 \
   -v $(pwd):/workspace \
   vggt-service:latest
 
@@ -78,7 +78,7 @@ docker run -d \
   --name vggt-service \
   --runtime=nvidia \
   -e NVIDIA_VISIBLE_DEVICES=all \
-  -p 8011:8000 \
+  -p 8003:8003 \
   -v $(pwd):/workspace \
   vggt-service:latest
 ```
@@ -90,6 +90,29 @@ docker run -d \
 ## API Endpoints
 
 All endpoints are prefixed with `/vggt_p/`.
+
+### Root Endpoint (Service Info)
+```bash
+GET /vggt_p/
+```
+
+**Response:**
+```json
+{
+  "service": "VGGT-P Service",
+  "version": "1.0",
+  "description": "Full pipeline from video to geolocalized object tracks with state estimation",
+  "status": "online",
+  "model_loaded": true,
+  "endpoints": {
+    "GET /vggt_p/": "Service information (this page)",
+    "GET /vggt_p/health": "Health check endpoint",
+    "POST /vggt_p/process": "Process video via URLs (video, flight log, tracking JSON)",
+    "POST /vggt_p/process-upload": "Process video via file upload"
+  },
+  "documentation": "See /docs/VGGT_P_API.md for detailed API documentation"
+}
+```
 
 ### Health Check
 ```bash
@@ -209,15 +232,17 @@ Content-Type: multipart/form-data
   },
   "tracks": [
     {
+      "timestamp": "2026-01-20T11:36:09.730000+00:00",
       "frame_id": 0,
       "track_id": 1,
       "bbox": [100, 200, 150, 250],
       "lat": 51.476123,
       "lon": -3.189234,
+      "alt": 58.1,
       "depth_m": 45.2,
       "pos_ned": [12.3, -8.5, -45.2],
       "vel_ned": [2.1, 0.5, -0.1],
-      "speed_mps": 2.16,
+      "speed_mph": 4.83,
       "heading_deg": 13.5
     }
   ]
@@ -230,7 +255,7 @@ Content-Type: multipart/form-data
 
 ### Using cURL (URL-based)
 ```bash
-curl -X POST http://localhost:8000/vggt_p/process \
+curl -X POST http://localhost:8003/vggt_p/process \
   -H "Content-Type: application/json" \
   -d '{
     "job_id": 123456,
@@ -248,7 +273,7 @@ curl -X POST http://localhost:8000/vggt_p/process \
 
 ### Using cURL (File Upload)
 ```bash
-curl -X POST http://localhost:8000/vggt_p/process-upload \
+curl -X POST http://localhost:8003/vggt_p/process-upload \
   -F "video=@video.mp4" \
   -F "flight_log=@flight_log.csv" \
   -F "tracking_json=@tracking.json" \
@@ -278,7 +303,7 @@ payload = {
 }
 
 response = requests.post(
-    'http://localhost:8000/vggt_p/process',
+    'http://localhost:8003/vggt_p/process',
     json=payload,
     timeout=600
 )
@@ -332,15 +357,16 @@ Approximate times for 45-second video at 5 FPS (225 frames):
 
 ### Tracks
 Each track entry contains:
+- `timestamp`: ISO 8601 timestamp with timezone (TIMESTAMPTZ), from flight log
 - `frame_id`: Frame number
 - `track_id`: Object ID
 - `bbox`: Bounding box [x1, y1, x2, y2]
-- `lat`, `lon`: GPS coordinates (WGS84)
+- `lat`, `lon`, `alt`: GPS coordinates (WGS84) with altitude in meters
 - `depth_m`: Depth in meters
 - `pos_ned`: Position in NED frame [N, E, D] meters
 - `vel_ned`: Velocity in NED frame [v_N, v_E, v_D] m/s
-- `speed_mps`: Horizontal speed in m/s
-- `heading_deg`: Heading in degrees (0=North, 90=East, clockwise)
+- `speed_mph`: Horizontal speed in mph
+- `heading_deg`: Heading in degrees (0°=North, 90°=East, -90°=West, ±180°=South, range [-180, 180])
 
 ---
 
@@ -348,8 +374,8 @@ Each track entry contains:
 
 ### Service won't start
 ```bash
-# Check if port 8000 is available
-lsof -i :8000
+# Check if port 8003 is available
+lsof -i :8003
 
 # Check GPU availability
 python -c "import torch; print(torch.cuda.is_available())"
@@ -371,7 +397,7 @@ docker run -d \
   --name vggt-service \
   --runtime=nvidia \
   -e NVIDIA_VISIBLE_DEVICES=all \
-  -p 8011:8000 \
+  -p 8003:8003 \
   -v $(pwd):/workspace \
   vggt-service:latest
 
@@ -402,7 +428,7 @@ docker exec vggt-service pip install scipy
 - [ ] GPU driver installed (CUDA 12.1+)
 - [ ] VGGT model pre-downloaded
 - [ ] scipy installed
-- [ ] Firewall rules configured for port 8000/8011
+- [ ] Firewall rules configured for port 8003
 - [ ] Service auto-restart configured (systemd/supervisor)
 - [ ] Logging configured for production
 - [ ] Health check monitoring enabled
