@@ -1187,90 +1187,230 @@ def _compute_cluster_area(positions_2d: np.ndarray, min_area_m2: float = 1.0) ->
 
 def cluster_crowds_per_frame(
     processed_tracks: List[Dict],
-    min_cluster_size: int = 5,
+    min_cluster_size: int = 10,
     min_samples: int = 3,
-    coherence_weight: float = 2.0,
+    coherence_weight: float = 10.0,
     max_walking_speed_mps: float = 2.0,
+    cluster_selection_epsilon: float = 2.0,
+    max_match_dist: float = 20.0,
+    ema_alpha: float = 0.4,
+    memory_frames: int = 15,
 ) -> None:
     """
-    Apply HDBSCAN clustering to person detections on a per-frame basis.
+    Apply temporally-stable HDBSCAN crowd clustering to person detections.
+
+    Uses a three-phase approach for stable crowd_id assignment:
+
+    Phase 1 — Per-frame physics clustering:
+        For each frame, extract person detections with valid pos_ned,
+        build 4D feature vectors [p_N, p_E, w*v_N, w*v_E], and run
+        HDBSCAN independently.  Compute macro-state (centroid, momentum)
+        for each local cluster.
+
+    Phase 2 — Crowd-level Hungarian matching:
+        Propagate stable global crowd IDs across frames by matching
+        previous-frame clusters to current-frame clusters using
+        scipy.optimize.linear_sum_assignment on a cost matrix of
+        spatial + velocity distance.  Unmatched clusters get new IDs.
+
+    Phase 3 — Stamp labels:
+        Write the resolved crowd_id onto every person detection.
+        HDBSCAN noise (label -1) → crowd_id = None.
 
     Mutates processed_tracks in-place, adding:
       - 'crowd_id': int (1-based) or None (noise / non-person)
-      - 'crowd_density': float (people/m^2 within cluster convex hull) or None
 
     Args:
         processed_tracks: List of track dicts (mutated in-place).
-        min_cluster_size: HDBSCAN min_cluster_size parameter.
-        min_samples: HDBSCAN min_samples parameter.
-        coherence_weight: Multiplier on velocity features.
-        max_walking_speed_mps: Max expected walking speed for velocity normalisation.
+        min_cluster_size: HDBSCAN min_cluster_size (default 10).
+        min_samples: HDBSCAN min_samples (default 3).
+        coherence_weight: Multiplier on velocity features (default 10.0).
+        max_walking_speed_mps: Max expected walking speed for velocity
+            normalisation (default 2.0).
+        cluster_selection_epsilon: HDBSCAN cluster_selection_epsilon
+            (default 2.0).
+        max_match_dist: Maximum cost for Hungarian match acceptance in
+            metres (default 20.0).  Pairs exceeding this are rejected.
+        ema_alpha: EMA smoothing factor for cluster centroid/momentum
+            (default 0.4).  1.0 = no smoothing (raw replacement).
+        memory_frames: Number of frames to remember absent clusters
+            (default 15).  At 10fps this is 1.5s of memory.
     """
     from sklearn.cluster import HDBSCAN
+    from scipy.optimize import linear_sum_assignment
     from collections import defaultdict
 
-    # Initialise all tracks with null crowd fields
+    # Initialise crowd_id
     for track in processed_tracks:
         track['crowd_id'] = None
-        track['crowd_density'] = None
 
-    # Group person detections by frame_id (store indices into processed_tracks)
-    persons_by_frame = defaultdict(list)
-    for i, track in enumerate(processed_tracks):
-        if track.get('class_name') == 'person':
-            persons_by_frame[track['frame_id']].append(i)
-
-    for frame_id, indices in persons_by_frame.items():
-        n_persons = len(indices)
-        if n_persons < min_cluster_size:
+    # ── Index person detections by frame ──────────────────────────────
+    # frame_id → list of (index_into_processed_tracks, pos_NE, vel_NE)
+    frames: Dict[int, List[Tuple[int, np.ndarray, np.ndarray]]] = defaultdict(list)
+    for idx, track in enumerate(processed_tracks):
+        if track.get('class_name') != 'person':
             continue
+        pos = track.get('pos_ned')
+        if pos is None:
+            continue
+        vel = track.get('vel_ned', [0, 0, 0])
+        frames[track['frame_id']].append((
+            idx,
+            np.array(pos[:2], dtype=np.float64),
+            np.array(vel[:2], dtype=np.float64),
+        ))
 
-        # Extract 4D features: [pos_N, pos_E, vel_N, vel_E]
-        positions = np.array([processed_tracks[i]['pos_ned'][:2] for i in indices])
-        velocities = np.array([
-            processed_tracks[i].get('vel_ned', [0, 0, 0])[:2] for i in indices
-        ])
+    if not frames:
+        return
 
-        # Scale positions: zero-centre and range-normalise
-        pos_min = positions.min(axis=0)
-        pos_max = positions.max(axis=0)
-        pos_range = pos_max - pos_min
-        pos_range = np.where(pos_range < 1e-6, 1.0, pos_range)
-        pos_scaled = (positions - pos_min) / pos_range
+    sorted_frame_ids = sorted(frames.keys())
 
-        # Scale velocities: normalise by max walking speed, then weight
+    # ── Helper: run HDBSCAN on one frame and return local clusters ────
+    def _cluster_frame(detections):
+        """Return dict: local_label → {'centroid', 'momentum', 'indices'}."""
+        if len(detections) < min_cluster_size:
+            return {}
+
+        positions = np.array([d[1] for d in detections])
+        velocities = np.array([d[2] for d in detections])
+
         vel_scaled = (velocities / max_walking_speed_mps) * coherence_weight
+        features = np.hstack([positions, vel_scaled])
 
-        features = np.hstack([pos_scaled, vel_scaled])
-
-        # Run HDBSCAN
         clusterer = HDBSCAN(
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
             metric='euclidean',
+            cluster_selection_epsilon=cluster_selection_epsilon,
         )
         labels = clusterer.fit_predict(features)
 
-        # Group by cluster label for density calculation
-        clusters = defaultdict(list)
-        for local_idx, label in enumerate(labels):
-            if label >= 0:
-                clusters[int(label)].append(local_idx)
+        clusters: Dict[int, Dict] = {}
+        for i, lbl in enumerate(labels):
+            if lbl < 0:
+                continue
+            if lbl not in clusters:
+                clusters[lbl] = {'pos': [], 'vel': [], 'indices': []}
+            clusters[lbl]['pos'].append(detections[i][1])
+            clusters[lbl]['vel'].append(detections[i][2])
+            clusters[lbl]['indices'].append(detections[i][0])
 
-        # Compute convex hull area per cluster
-        cluster_density = {}
-        for label, member_local_indices in clusters.items():
-            cluster_positions = positions[member_local_indices]
-            n_members = len(member_local_indices)
-            area = _compute_cluster_area(cluster_positions)
-            cluster_density[label] = round(n_members / area, 4) if area > 0 else None
+        # Compute macro-state per cluster
+        result = {}
+        for lbl, data in clusters.items():
+            result[lbl] = {
+                'centroid': np.median(data['pos'], axis=0),
+                'momentum': np.median(data['vel'], axis=0),
+                'indices': data['indices'],
+            }
+        return result
 
-        # Assign crowd_id (1-based) and crowd_density
-        for local_idx, global_idx in enumerate(indices):
-            label = int(labels[local_idx])
-            if label >= 0:
-                processed_tracks[global_idx]['crowd_id'] = label + 1
-                processed_tracks[global_idx]['crowd_density'] = cluster_density.get(label)
+    # ── Phase 1 + 2: per-frame clustering with Hungarian matching ─────
+    next_global_id = 1
+    # cluster_memory: gid -> {centroid, momentum, age}
+    cluster_memory: Dict[int, Dict] = {}
+    # Accumulate: processed_tracks index → global crowd_id
+    crowd_assignments: Dict[int, int] = {}
+
+    alpha = ema_alpha
+
+    for fid in sorted_frame_ids:
+        detections = frames[fid]
+        local_clusters = _cluster_frame(detections)
+
+        if not local_clusters:
+            # No valid clusters this frame — increment ages, prune stale
+            for entry in cluster_memory.values():
+                entry['age'] += 1
+            cluster_memory = {
+                gid: e for gid, e in cluster_memory.items()
+                if e['age'] < memory_frames
+            }
+            continue
+
+        local_list = list(local_clusters.values())
+
+        # Build candidate list from memory
+        candidates = [
+            (gid, entry) for gid, entry in cluster_memory.items()
+            if entry['age'] < memory_frames
+        ]
+
+        if not candidates:
+            # No memory — assign new global IDs
+            for lc in local_list:
+                gid = next_global_id
+                next_global_id += 1
+                for tidx in lc['indices']:
+                    crowd_assignments[tidx] = gid
+                cluster_memory[gid] = {
+                    'centroid': lc['centroid'].copy(),
+                    'momentum': lc['momentum'].copy(),
+                    'age': 0,
+                }
+            # Increment age for any stale entries and prune
+            for gid_old in list(cluster_memory.keys()):
+                e = cluster_memory[gid_old]
+                if e['age'] != 0:
+                    e['age'] += 1
+                    if e['age'] >= memory_frames:
+                        del cluster_memory[gid_old]
+            continue
+
+        # Build cost matrix: candidates (rows) × current (cols)
+        n_cand = len(candidates)
+        n_curr = len(local_list)
+        cost = np.empty((n_cand, n_curr), dtype=np.float64)
+
+        for i, (_, entry) in enumerate(candidates):
+            for j, lc in enumerate(local_list):
+                spatial = np.linalg.norm(entry['centroid'] - lc['centroid'])
+                vel_d = np.linalg.norm(entry['momentum'] - lc['momentum']) / max_walking_speed_mps
+                cost[i, j] = spatial + coherence_weight * vel_d
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        matched_curr = set()
+        seen_gids = set()
+
+        for ri, ci in zip(row_ind, col_ind):
+            if cost[ri, ci] <= max_match_dist:
+                gid = candidates[ri][0]
+                lc = local_list[ci]
+                for tidx in lc['indices']:
+                    crowd_assignments[tidx] = gid
+                # EMA smooth centroid/momentum
+                entry = cluster_memory[gid]
+                entry['centroid'] = alpha * lc['centroid'] + (1 - alpha) * entry['centroid']
+                entry['momentum'] = alpha * lc['momentum'] + (1 - alpha) * entry['momentum']
+                entry['age'] = 0
+                matched_curr.add(ci)
+                seen_gids.add(gid)
+
+        # Unmatched current clusters → new global IDs
+        for ci, lc in enumerate(local_list):
+            if ci not in matched_curr:
+                gid = next_global_id
+                next_global_id += 1
+                for tidx in lc['indices']:
+                    crowd_assignments[tidx] = gid
+                cluster_memory[gid] = {
+                    'centroid': lc['centroid'].copy(),
+                    'momentum': lc['momentum'].copy(),
+                    'age': 0,
+                }
+                seen_gids.add(gid)
+
+        # Increment age for unseen entries, prune stale
+        for gid_old in list(cluster_memory.keys()):
+            if gid_old not in seen_gids:
+                cluster_memory[gid_old]['age'] += 1
+                if cluster_memory[gid_old]['age'] >= memory_frames:
+                    del cluster_memory[gid_old]
+
+    # ── Phase 3: stamp labels ─────────────────────────────────────────
+    for tidx, gid in crowd_assignments.items():
+        processed_tracks[tidx]['crowd_id'] = gid
 
 
 def process_tracks(
@@ -1291,10 +1431,14 @@ def process_tracks(
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
     use_osd_yaw: bool = False,
-    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int = 3,
-    hdbscan_coherence_weight: float = 2.0,
+    hdbscan_coherence_weight: float = 10.0,
     hdbscan_max_speed_mps: float = 2.0,
+    hdbscan_cluster_selection_epsilon: float = 2.0,
+    hdbscan_max_match_dist: float = 20.0,
+    hdbscan_ema_alpha: float = 0.4,
+    hdbscan_memory_frames: int = 15,
 ) -> List[Dict]:
     """
     Process all tracks and estimate their states.
@@ -1369,6 +1513,8 @@ def process_tracks(
             for track in obj_tracks:
                 frame_id = track['frame_id']
                 bbox = track['bbox']
+                if bbox is None:
+                    continue
 
                 # Get telemetry for this frame
                 if frame_id >= len(flight_data):
@@ -1507,6 +1653,8 @@ def process_tracks(
             for track in obj_tracks:
                 frame_id = track['frame_id']
                 bbox = track['bbox']
+                if bbox is None:
+                    continue
 
                 # Get telemetry for this frame
                 if frame_id >= len(flight_data):
@@ -1631,31 +1779,140 @@ def process_tracks(
 
         track['heading_deg'] = heading_deg
 
-    # Calculate density for each track (objects within 10m radius at same frame)
+    # Per-person local crowd density via Voronoi tessellation
+    #   crowd_density = 1 / voronoi_cell_area   [persons/m²]
+    # Each person's Voronoi cell is the region closer to them than to any
+    # other person.  Boundary cells (infinite) are clipped to the convex
+    # hull of all persons, buffered by BOUNDARY_BUFFER_M.
+    # Also keep 'density' as the raw neighbour count (all classes, 10m) for
+    # backward compatibility.
+    from scipy.spatial import cKDTree, Voronoi, ConvexHull
+    from collections import defaultdict as _defaultdict
+
+    COMPAT_RADIUS_M = 10.0                           # legacy 'density' radius
+    BOUNDARY_BUFFER_M = 5.0                          # buffer around convex hull for clipping
+    MAX_CELL_AREA_M2 = 200.0                         # cap for isolated persons
+
+    def _voronoi_cell_areas(points_2d):
+        """Compute Voronoi cell areas for a set of 2D points.
+
+        Boundary cells are clipped to the convex hull buffered by
+        BOUNDARY_BUFFER_M so they get finite, reasonable areas.
+
+        Returns:
+            areas: np.ndarray of shape (n,) with cell area per point.
+        """
+        n = len(points_2d)
+        if n == 1:
+            return np.array([MAX_CELL_AREA_M2])
+        if n == 2:
+            dist = np.linalg.norm(points_2d[0] - points_2d[1])
+            # Each person "owns" a rectangle of width=dist, height=buffer
+            area = max(dist * BOUNDARY_BUFFER_M, 1.0)
+            return np.array([area, area])
+
+        # Build a clipping polygon: convex hull buffered outward
+        try:
+            hull = ConvexHull(points_2d)
+        except Exception:
+            return np.full(n, MAX_CELL_AREA_M2)
+
+        hull_pts = points_2d[hull.vertices]
+        centroid = hull_pts.mean(axis=0)
+        # Expand hull outward by BOUNDARY_BUFFER_M
+        directions = hull_pts - centroid
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-9)
+        buffered_hull = hull_pts + directions / norms * BOUNDARY_BUFFER_M
+
+        # Mirror points across the buffered hull boundary to make all
+        # Voronoi cells finite.  Simpler and more robust than polygon
+        # clipping: reflect each hull-boundary person across the hull edge.
+        # Instead, we use a bounding-box mirror approach.
+        bbox_min = buffered_hull.min(axis=0) - BOUNDARY_BUFFER_M
+        bbox_max = buffered_hull.max(axis=0) + BOUNDARY_BUFFER_M
+
+        # Add mirror points outside the bounding box
+        mirrors = np.vstack([
+            np.column_stack([2 * bbox_min[0] - points_2d[:, 0], points_2d[:, 1]]),
+            np.column_stack([2 * bbox_max[0] - points_2d[:, 0], points_2d[:, 1]]),
+            np.column_stack([points_2d[:, 0], 2 * bbox_min[1] - points_2d[:, 1]]),
+            np.column_stack([points_2d[:, 0], 2 * bbox_max[1] - points_2d[:, 1]]),
+        ])
+        augmented = np.vstack([points_2d, mirrors])
+
+        try:
+            vor = Voronoi(augmented)
+        except Exception:
+            return np.full(n, MAX_CELL_AREA_M2)
+
+        areas = np.full(n, MAX_CELL_AREA_M2)
+        for i in range(n):  # only original points
+            region_idx = vor.point_region[i]
+            region = vor.regions[region_idx]
+            if -1 in region or len(region) < 3:
+                continue
+            polygon = vor.vertices[region]
+            # Shoelace formula for polygon area
+            x, y = polygon[:, 0], polygon[:, 1]
+            area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+            areas[i] = min(max(area, 0.01), MAX_CELL_AREA_M2)
+
+        return areas
+
+    # Group track indices by frame_id
+    frame_indices = _defaultdict(list)
+    for i, track in enumerate(processed_tracks):
+        frame_indices[track['frame_id']].append(i)
+
+    # Initialise fields
     for track in processed_tracks:
-        frame_id = track.get('frame_id')
-        track_id = track.get('track_id')
-        pos = np.array(track.get('pos_ned', [0, 0, 0]))
+        track['density'] = 0
+        track['crowd_density'] = None
 
-        # Count other objects at same frame within 10m radius
-        count = 0
-        for other_track in processed_tracks:
-            other_frame_id = other_track.get('frame_id')
-            other_track_id = other_track.get('track_id')
+    print("Computing per-person crowd density (Voronoi tessellation) ...")
+    for frame_id, indices in frame_indices.items():
+        # Separate persons and non-UAV tracks
+        person_idx = []   # indices into processed_tracks for persons
+        all_idx = []       # all non-UAV indices
+        for i in indices:
+            t = processed_tracks[i]
+            if t.get('track_id') == 0:       # skip UAV
+                continue
+            all_idx.append(i)
+            if t.get('class_name') == 'person':
+                person_idx.append(i)
 
-            # Same frame, different track, not UAV
-            if (other_frame_id == frame_id and
-                other_track_id != track_id and
-                other_track_id != 0):
-                other_pos = np.array(other_track.get('pos_ned', [0, 0, 0]))
-                distance = np.linalg.norm(pos - other_pos)
-                if distance <= 10.0:
-                    count += 1
+        if not all_idx:
+            continue
 
-        track['density'] = count
+        # Build positions arrays
+        all_positions = np.array([
+            processed_tracks[i]['pos_ned'][:2] for i in all_idx
+        ])
 
-    # HDBSCAN crowd clustering (person detections only)
-    print("Running HDBSCAN crowd clustering on person detections...")
+        # cKDTree for all non-UAV objects (used for legacy 'density')
+        tree_all = cKDTree(all_positions)
+
+        # Legacy density: count of all non-UAV neighbours within 10 m
+        neighbours_10m = tree_all.query_ball_tree(tree_all, r=COMPAT_RADIUS_M)
+        for local_j, global_j in enumerate(all_idx):
+            # subtract 1 to exclude the point itself
+            processed_tracks[global_j]['density'] = len(neighbours_10m[local_j]) - 1
+
+        # Per-person crowd_density via Voronoi: density = 1 / cell_area
+        if person_idx:
+            person_positions = np.array([
+                processed_tracks[i]['pos_ned'][:2] for i in person_idx
+            ])
+            cell_areas = _voronoi_cell_areas(person_positions)
+            for local_j, global_j in enumerate(person_idx):
+                processed_tracks[global_j]['crowd_density'] = round(
+                    1.0 / cell_areas[local_j], 4
+                )
+
+    # HDBSCAN crowd clustering (per-frame + Hungarian matching)
+    print("Running HDBSCAN crowd clustering (per-frame + Hungarian matching) ...")
     try:
         cluster_crowds_per_frame(
             processed_tracks,
@@ -1663,6 +1920,10 @@ def process_tracks(
             min_samples=hdbscan_min_samples,
             coherence_weight=hdbscan_coherence_weight,
             max_walking_speed_mps=hdbscan_max_speed_mps,
+            cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+            max_match_dist=hdbscan_max_match_dist,
+            ema_alpha=hdbscan_ema_alpha,
+            memory_frames=hdbscan_memory_frames,
         )
         n_clustered = sum(1 for t in processed_tracks if t.get('crowd_id') is not None)
         unique_crowds = set(
@@ -1675,12 +1936,10 @@ def process_tracks(
         print("  Warning: sklearn HDBSCAN not available. Skipping crowd clustering.")
         for track in processed_tracks:
             track['crowd_id'] = None
-            track['crowd_density'] = None
     except Exception as e:
-        print(f"  Warning: Crowd clustering failed: {e}. All crowd fields set to null.")
+        print(f"  Warning: Crowd clustering failed: {e}. All crowd_id fields set to null.")
         for track in processed_tracks:
             track['crowd_id'] = None
-            track['crowd_density'] = None
 
     # Reorder all tracks to have consistent field ordering with timestamp first
     reordered_tracks = []

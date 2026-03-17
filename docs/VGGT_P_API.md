@@ -167,7 +167,7 @@ Submits a video, flight log, and tracking JSON for depth estimation and state es
 |-----------|------|---------|-------------|
 | `hdbscan_min_cluster_size` | int | 5 | Minimum number of person detections to form a crowd cluster (≥2) |
 | `hdbscan_min_samples` | int | 3 | Controls how conservative clustering is — higher = more conservative (≥1) |
-| `hdbscan_coherence_weight` | float | 2.0 | Weight multiplier on velocity features (higher = more emphasis on movement coherence) |
+| `hdbscan_coherence_weight` | float | 5.0 | Weight multiplier on velocity features (higher = more emphasis on movement coherence) |
 | `hdbscan_max_speed_mps` | float | 2.0 | Max expected walking speed (m/s) for velocity normalisation |
 
 ### Response
@@ -196,7 +196,7 @@ Submits a video, flight log, and tracking JSON for depth estimation and state es
       "method": "HDBSCAN",
       "min_cluster_size": 5,
       "min_samples": 3,
-      "coherence_weight": 2.0,
+      "coherence_weight": 5.0,
       "max_speed_mps": 2.0
     }
   },
@@ -253,7 +253,7 @@ Submits a video, flight log, and tracking JSON for depth estimation and state es
 | `heading_deg` | float | Heading in degrees (0°=North, 90°=East, -90°=West, ±180°=South, range [-180, 180]) |
 | `density` | int | Count of other objects within 10m radius at the same frame |
 | `crowd_id` | int \| null | HDBSCAN crowd cluster ID (1-based). `null` for noise, non-person objects, or UAV |
-| `crowd_density` | float \| null | People per m² within the cluster's convex hull area. `null` when `crowd_id` is null |
+| `crowd_density` | float \| null | Local crowd density (p/m²) via Voronoi tessellation — `1 / voronoi_cell_area`. `null` for non-person or missing position. See [CROWD_ANALYSIS.md](CROWD_ANALYSIS.md) |
 
 ### Errors
 
@@ -362,7 +362,7 @@ File upload variant of `/process`. Use this endpoint when sending files directly
 | `timezone` | string | No | "UTC" | Timezone for flight log local timestamps |
 | `hdbscan_min_cluster_size` | int | No | 5 | Min person detections to form a crowd |
 | `hdbscan_min_samples` | int | No | 3 | HDBSCAN conservativeness |
-| `hdbscan_coherence_weight` | float | No | 2.0 | Velocity feature weight |
+| `hdbscan_coherence_weight` | float | No | 5.0 | Velocity feature weight |
 | `hdbscan_max_speed_mps` | float | No | 2.0 | Max walking speed for normalisation |
 
 ### Response

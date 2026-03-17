@@ -55,10 +55,15 @@ class VGGTParameters(BaseModel):
     add_drone_yaw: bool = Field(default=False, description="Add drone yaw to gimbal yaw")
     use_osd_yaw: bool = Field(default=False, description="Use OSD.yaw instead of GIMBAL.yaw")
     timezone: str = Field(default="UTC", description="Timezone of flight log local timestamps (e.g., 'UTC', 'Europe/London')")
-    hdbscan_min_cluster_size: int = Field(default=5, description="HDBSCAN min_cluster_size: minimum person detections to form a crowd", ge=2)
+    hdbscan_min_cluster_size: int = Field(default=10, description="HDBSCAN min_cluster_size: minimum unique person tracks to form a crowd", ge=2)
     hdbscan_min_samples: int = Field(default=3, description="HDBSCAN min_samples: higher = more conservative clustering", ge=1)
-    hdbscan_coherence_weight: float = Field(default=2.0, description="Weight on velocity features for crowd clustering", ge=0.0)
+    hdbscan_coherence_weight: float = Field(default=10.0, description="Weight on velocity features for crowd clustering", ge=0.0)
     hdbscan_max_speed_mps: float = Field(default=2.0, description="Max walking speed (m/s) for velocity normalisation", gt=0.0)
+    hdbscan_cluster_selection_epsilon: float = Field(default=2.0, description="HDBSCAN epsilon: prevents over-fragmenting nearby sub-clusters (metres)", ge=0.0)
+    hdbscan_max_match_dist: float = Field(default=20.0, description="Max cost for Hungarian crowd-cluster matching across frames (metres)", gt=0.0)
+    hdbscan_ema_alpha: float = Field(default=0.4, description="EMA smoothing factor for cluster centroid/momentum (1.0 = no smoothing)", ge=0.0, le=1.0)
+    hdbscan_memory_frames: int = Field(default=15, description="Frames to remember absent clusters (e.g. 15 = 1.5s at 10fps)", ge=1)
+    tracking_fps: Optional[float] = Field(default=None, description="FPS of tracking JSON (if different from extraction fps, frame IDs are remapped)")
 
 
 class VGGTRequest(BaseModel):
@@ -195,6 +200,11 @@ async def process_video(request: VGGTRequest):
                 hdbscan_min_samples=request.parameters.hdbscan_min_samples,
                 hdbscan_coherence_weight=request.parameters.hdbscan_coherence_weight,
                 hdbscan_max_speed_mps=request.parameters.hdbscan_max_speed_mps,
+                hdbscan_cluster_selection_epsilon=request.parameters.hdbscan_cluster_selection_epsilon,
+                hdbscan_max_match_dist=request.parameters.hdbscan_max_match_dist,
+                hdbscan_ema_alpha=request.parameters.hdbscan_ema_alpha,
+                hdbscan_memory_frames=request.parameters.hdbscan_memory_frames,
+                tracking_fps=request.parameters.tracking_fps,
             )
 
             # Return JSON response
@@ -224,10 +234,15 @@ async def process_video_upload(
     use_osd_yaw: bool = Form(False),
     timezone: str = Form("UTC"),
     # Crowd clustering (HDBSCAN) parameters
-    hdbscan_min_cluster_size: int = Form(5),
+    hdbscan_min_cluster_size: int = Form(10),
     hdbscan_min_samples: int = Form(3),
-    hdbscan_coherence_weight: float = Form(2.0),
+    hdbscan_coherence_weight: float = Form(10.0),
     hdbscan_max_speed_mps: float = Form(2.0),
+    hdbscan_cluster_selection_epsilon: float = Form(2.0),
+    hdbscan_max_match_dist: float = Form(20.0),
+    hdbscan_ema_alpha: float = Form(0.4),
+    hdbscan_memory_frames: int = Form(15),
+    tracking_fps: Optional[float] = Form(None),
 ):
     """
     Process video through full VGGT + state estimation pipeline (file upload version).
@@ -291,6 +306,11 @@ async def process_video_upload(
                 hdbscan_min_samples=hdbscan_min_samples,
                 hdbscan_coherence_weight=hdbscan_coherence_weight,
                 hdbscan_max_speed_mps=hdbscan_max_speed_mps,
+                hdbscan_cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+                hdbscan_max_match_dist=hdbscan_max_match_dist,
+                hdbscan_ema_alpha=hdbscan_ema_alpha,
+                hdbscan_memory_frames=hdbscan_memory_frames,
+                tracking_fps=tracking_fps,
             )
 
             # Return JSON response
@@ -427,10 +447,15 @@ def run_state_estimation(
     add_drone_yaw: bool,
     use_osd_yaw: bool,
     timezone: str = "UTC",
-    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int = 3,
-    hdbscan_coherence_weight: float = 2.0,
+    hdbscan_coherence_weight: float = 10.0,
     hdbscan_max_speed_mps: float = 2.0,
+    hdbscan_cluster_selection_epsilon: float = 2.0,
+    hdbscan_max_match_dist: float = 20.0,
+    hdbscan_ema_alpha: float = 0.4,
+    hdbscan_memory_frames: int = 15,
+    tracking_fps: Optional[float] = None,
 ) -> Dict:
     """Run state estimation and return JSON result."""
     import pandas as pd
@@ -446,6 +471,17 @@ def run_state_estimation(
     tracks = tracking_data.get('tracks', [])
     if not tracks:
         raise ValueError("No tracks found in tracking JSON")
+
+    # Resample tracking frame IDs if tracking was done at a different FPS
+    if tracking_fps is not None and tracking_fps != fps:
+        ratio = tracking_fps / fps
+        logger.info(f"Resampling tracking frame IDs: {tracking_fps} fps -> {fps} fps (ratio {ratio:.2f})")
+        for t in tracks:
+            t['frame_id'] = round(t['frame_id'] / ratio)
+        # Deduplicate: multiple 30fps frames map to the same 10fps frame
+        # Keep all detections (they'll share the same depth map)
+        unique_frames = len(set(t['frame_id'] for t in tracks))
+        logger.info(f"  Remapped to {unique_frames} unique frames")
 
     # Load flight record
     flight_data, home_position = load_flight_record(flight_log_path, timezone=timezone)
@@ -487,6 +523,10 @@ def run_state_estimation(
         hdbscan_min_samples=hdbscan_min_samples,
         hdbscan_coherence_weight=hdbscan_coherence_weight,
         hdbscan_max_speed_mps=hdbscan_max_speed_mps,
+        hdbscan_cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+        hdbscan_max_match_dist=hdbscan_max_match_dist,
+        hdbscan_ema_alpha=hdbscan_ema_alpha,
+        hdbscan_memory_frames=hdbscan_memory_frames,
     )
 
     logger.info(f"Processed {len(processed_tracks)} track entries")
@@ -510,11 +550,16 @@ def run_state_estimation(
                 "sigma_meas_v": kf_sigma_meas_v
             },
             "crowd_clustering": {
-                "method": "HDBSCAN",
+                "method": "HDBSCAN_per_frame_hungarian",
                 "min_cluster_size": hdbscan_min_cluster_size,
                 "min_samples": hdbscan_min_samples,
                 "coherence_weight": hdbscan_coherence_weight,
-                "max_speed_mps": hdbscan_max_speed_mps
+                "max_speed_mps": hdbscan_max_speed_mps,
+                "cluster_selection_epsilon": hdbscan_cluster_selection_epsilon,
+                "max_match_dist": hdbscan_max_match_dist,
+                "ema_alpha": hdbscan_ema_alpha,
+                "memory_frames": hdbscan_memory_frames,
+                "note": "Per-frame HDBSCAN with Hungarian centroid matching, EMA smoothing, and multi-frame memory for stable crowd IDs"
             }
         },
         "tracks": processed_tracks
@@ -527,6 +572,215 @@ def run_state_estimation(
 app.include_router(router)
 
 
+def create_detection_video(
+    video_path: str,
+    tracking_json_path: str,
+    output_path: str,
+    fps: float = 10.0,
+):
+    """Overlay detection bboxes on original video frames and save as MP4.
+
+    Draws class-colored bounding boxes with track_id labels on each frame.
+    """
+    from main import extract_frames_from_video
+
+    CLASS_COLORS_BGR = {
+        'person':     (0, 255, 0),
+        'car':        (0, 0, 255),
+        'vehicle':    (255, 0, 0),
+        'cycle':      (255, 255, 0),
+        'bus':        (255, 0, 255),
+        'track_leaf': (0, 215, 255),
+    }
+    FALLBACK_COLOR = (170, 170, 170)
+
+    # Load tracking JSON
+    with open(tracking_json_path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        tracks = data.get('tracks', [])
+    else:
+        tracks = data
+
+    # Group detections by frame_id (skip entries without bbox)
+    by_frame = {}
+    for t in tracks:
+        fid = t.get('frame_id')
+        bbox = t.get('bbox')
+        if fid is None or bbox is None:
+            continue
+        by_frame.setdefault(fid, []).append(t)
+
+    # Extract frames
+    frames = extract_frames_from_video(video_path, fps=fps)
+    if len(frames) == 0:
+        logger.warning("No frames extracted, skipping detection video")
+        return
+
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    for frame_idx, frame in enumerate(frames):
+        canvas = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        dets = by_frame.get(frame_idx, [])
+        for det in dets:
+            bbox = det['bbox']
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            cls = det.get('class_name', 'unknown')
+            tid = det.get('track_id', '')
+            conf = det.get('confidence')
+            color = CLASS_COLORS_BGR.get(cls, FALLBACK_COLOR)
+
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+
+            label = f'{cls} #{tid}'
+            if conf is not None:
+                label += f' {conf:.2f}'
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(canvas, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(canvas, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # Frame counter
+        cv2.putText(canvas, f'Frame: {frame_idx}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+        writer.write(canvas)
+
+    writer.release()
+    logger.info(f"Detection video: {len(frames)} frames -> {output_path}")
+
+
+def run_offline(args):
+    """Run the full pipeline offline (no FastAPI server)."""
+    global MODEL, DEVICE, DTYPE
+
+    # --- Load model --------------------------------------------------------
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE = (
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+        else torch.float16
+    )
+    logger.info(f"Loading VGGT model on {DEVICE} with dtype {DTYPE}")
+    MODEL = VGGT.from_pretrained("facebook/VGGT-1B").to(DEVICE)
+    MODEL.eval()
+    logger.info("Model loaded successfully")
+
+    # --- Prepare working directory ----------------------------------------
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: VGGT depth inference -------------------------------------
+    logger.info("Step 1: Running VGGT depth estimation")
+    depth_dir = output_dir / "depth_metric"
+    intrinsics_path = output_dir / "cameras" / "intrinsics.npy"
+
+    run_vggt_inference(
+        video_path=args.video,
+        flight_log_path=args.flight_log,
+        output_dir=str(output_dir),
+        fps=args.fps,
+        batch_size=args.batch_size,
+    )
+
+    # --- Step 2: State estimation -----------------------------------------
+    logger.info("Step 2: Running state estimation with Kalman Filter")
+    output_json = run_state_estimation(
+        tracking_json_path=args.tracking_json,
+        flight_log_path=args.flight_log,
+        depth_dir=str(depth_dir),
+        intrinsics_path=str(intrinsics_path),
+        source_res=tuple(args.source_res),
+        fps=args.fps,
+        kf_sigma_a=args.kf_sigma_a,
+        kf_sigma_meas_h=args.kf_sigma_meas_h,
+        kf_sigma_meas_v=args.kf_sigma_meas_v,
+        yaw_offset=args.yaw_offset,
+        magnetic_declination=args.magnetic_declination,
+        add_drone_yaw=args.add_drone_yaw,
+        use_osd_yaw=args.use_osd_yaw,
+        timezone=args.timezone,
+        hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
+        hdbscan_min_samples=args.hdbscan_min_samples,
+        hdbscan_coherence_weight=args.hdbscan_coherence_weight,
+        hdbscan_max_speed_mps=args.hdbscan_max_speed_mps,
+        hdbscan_cluster_selection_epsilon=args.hdbscan_cluster_selection_epsilon,
+        hdbscan_max_match_dist=args.hdbscan_max_match_dist,
+        hdbscan_ema_alpha=args.hdbscan_ema_alpha,
+        hdbscan_memory_frames=args.hdbscan_memory_frames,
+        tracking_fps=args.tracking_fps,
+    )
+
+    # --- Save output ------------------------------------------------------
+    output_path = output_dir / args.output
+    with open(output_path, "w") as f:
+        json.dump(output_json, f, indent=2)
+    logger.info(f"Saved output to {output_path}")
+    logger.info(f"Tracks: {len(output_json['tracks'])}")
+    print(f"\nDone! Output saved to: {output_path}")
+
+    # --- Step 3: Detection video ------------------------------------------
+    logger.info("Step 3: Generating detection video")
+    det_video_path = output_dir / "detections.mp4"
+    create_detection_video(
+        video_path=args.video,
+        tracking_json_path=args.tracking_json,
+        output_path=str(det_video_path),
+        fps=args.fps,
+    )
+    logger.info(f"Detection video saved to {det_video_path}")
+
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="VGGT-P: full pipeline (offline or service)")
+    sub = parser.add_subparsers(dest="mode")
+
+    # --- 'serve' sub-command (default FastAPI) ----------------------------
+    srv = sub.add_parser("serve", help="Run as FastAPI service")
+    srv.add_argument("--host", default="0.0.0.0")
+    srv.add_argument("--port", type=int, default=8003)
+
+    # --- 'offline' sub-command --------------------------------------------
+    off = sub.add_parser("offline", help="Run full pipeline on local files")
+    off.add_argument("--video", "-v", required=True, help="Path to input MP4 video")
+    off.add_argument("--flight-log", "-f", required=True, help="Path to DJI flight log CSV")
+    off.add_argument("--tracking-json", "-t", required=True, help="Path to DET-TRACK output JSON")
+    off.add_argument("--output-dir", "-d", default="outputs", help="Output directory (default: outputs)")
+    off.add_argument("--output", "-o", default="state_estimation.json", help="Output JSON filename (default: state_estimation.json)")
+    off.add_argument("--source-res", type=int, nargs=2, default=[1920, 1080], metavar=("W", "H"), help="Source video resolution (default: 1920 1080)")
+    off.add_argument("--fps", type=float, default=10.0, help="Frame extraction rate (default: 10.0)")
+    off.add_argument("--batch-size", type=int, default=5, help="VGGT inference batch size (default: 5)")
+    # Kalman Filter
+    off.add_argument("--kf-sigma-a", type=float, default=0.5, help="KF process noise std (default: 0.5)")
+    off.add_argument("--kf-sigma-meas-h", type=float, default=5.0, help="KF horizontal measurement noise std (default: 5.0)")
+    off.add_argument("--kf-sigma-meas-v", type=float, default=2.0, help="KF vertical measurement noise std (default: 2.0)")
+    # Yaw
+    off.add_argument("--yaw-offset", type=float, default=0.0, help="Yaw calibration offset in degrees")
+    off.add_argument("--magnetic-declination", type=float, default=0.0, help="Magnetic declination in degrees")
+    off.add_argument("--add-drone-yaw", action="store_true", help="Add drone heading to gimbal yaw")
+    off.add_argument("--use-osd-yaw", action="store_true", help="Use OSD.yaw instead of GIMBAL.yaw")
+    off.add_argument("--timezone", default="UTC", help="Flight log timezone (default: UTC)")
+    # HDBSCAN
+    off.add_argument("--hdbscan-min-cluster-size", type=int, default=10, help="HDBSCAN min cluster size (default: 10)")
+    off.add_argument("--hdbscan-min-samples", type=int, default=3, help="HDBSCAN min samples (default: 3)")
+    off.add_argument("--hdbscan-coherence-weight", type=float, default=5.0, help="Velocity feature weight (default: 5.0)")
+    off.add_argument("--hdbscan-max-speed-mps", type=float, default=2.0, help="Max walking speed m/s (default: 2.0)")
+    off.add_argument("--hdbscan-cluster-selection-epsilon", type=float, default=2.0, help="HDBSCAN epsilon to prevent over-fragmentation (metres, default: 2.0)")
+    off.add_argument("--hdbscan-max-match-dist", type=float, default=20.0, help="Max cost for Hungarian crowd-cluster matching (metres, default: 20.0)")
+    off.add_argument("--hdbscan-ema-alpha", type=float, default=0.4, help="EMA smoothing for cluster centroid/momentum (0-1, default: 0.4)")
+    off.add_argument("--hdbscan-memory-frames", type=int, default=15, help="Frames to remember absent clusters (default: 15 = 1.5s at 10fps)")
+    off.add_argument("--tracking-fps", type=float, default=None, help="FPS of tracking JSON (remaps frame IDs if different from --fps)")
+
+    args = parser.parse_args()
+
+    if args.mode == "offline":
+        run_offline(args)
+    else:
+        import uvicorn
+        host = getattr(args, "host", "0.0.0.0")
+        port = getattr(args, "port", 8003)
+        uvicorn.run(app, host=host, port=port)
