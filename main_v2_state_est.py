@@ -304,9 +304,9 @@ def parse_args():
         help="Add drone heading (OSD.yaw) to gimbal yaw. Default: OFF (gimbal yaw is typically already absolute in DJI logs)"
     )
     parser.add_argument(
-        "--use-osd-yaw",
+        "--use-gimbal-yaw",
         action="store_true",
-        help="Use OSD.yaw (drone heading) instead of GIMBAL.yaw for yaw angle"
+        help="Use GIMBAL.yaw instead of OSD.yaw (drone heading) for yaw angle. Default: OSD.yaw"
     )
     parser.add_argument(
         "--timezone",
@@ -791,7 +791,7 @@ def gimbal_to_rotation_matrix(
     yaw_offset_deg: float = 0.0,
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
-    use_osd_yaw: bool = False
+    use_gimbal_yaw: bool = False
 ) -> np.ndarray:
     """
     Convert DJI gimbal angles to rotation matrix (Camera -> NED).
@@ -823,30 +823,31 @@ def gimbal_to_rotation_matrix(
         yaw_offset_deg: Additional yaw offset for calibration (degrees)
         magnetic_declination_deg: Magnetic declination (positive=East, negative=West)
         add_drone_yaw: If True, add drone yaw to gimbal yaw. Default False since DJI gimbal yaw is typically already absolute.
-        use_osd_yaw: If True, use OSD.yaw (drone heading) instead of GIMBAL.yaw for yaw angle.
+        use_gimbal_yaw: If True, use GIMBAL.yaw instead of OSD.yaw for yaw angle. Default: OSD.yaw (drone heading).
 
     Returns:
         3x3 rotation matrix R_cam_to_ned
     """
     gimbal_mode_lower = gimbal_mode.lower() if isinstance(gimbal_mode, str) else 'follow'
 
-    # Option to use OSD.yaw (drone heading) instead of GIMBAL.yaw
-    if use_osd_yaw:
-        # Use drone heading directly as the yaw angle
-        base_yaw_deg = drone_yaw_deg
-    else:
-        # Use gimbal yaw (default - typically already absolute in DJI logs)
+    # Default: use OSD.yaw (drone heading); opt-in: use GIMBAL.yaw
+    if use_gimbal_yaw:
+        # Use gimbal yaw (typically already absolute in DJI logs)
         base_yaw_deg = yaw_deg
+    else:
+        # Use drone heading directly as the yaw angle (default)
+        base_yaw_deg = drone_yaw_deg
 
     # Determine absolute angles based on gimbal mode
     if 'fpv' in gimbal_mode_lower:
         # FPV Mode: Roll is locked to drone body, not horizon-stabilized
-        if use_osd_yaw:
-            absolute_yaw_deg = base_yaw_deg  # Already using OSD.yaw
-        elif add_drone_yaw:
-            absolute_yaw_deg = drone_yaw_deg + yaw_deg
+        if use_gimbal_yaw:
+            if add_drone_yaw:
+                absolute_yaw_deg = drone_yaw_deg + yaw_deg
+            else:
+                absolute_yaw_deg = base_yaw_deg  # Already absolute
         else:
-            absolute_yaw_deg = base_yaw_deg  # Already absolute
+            absolute_yaw_deg = base_yaw_deg  # Already using OSD.yaw (default)
         absolute_pitch_deg = pitch_deg
         absolute_roll_deg = drone_roll_deg + roll_deg  # Locked to drone body roll
 
@@ -858,12 +859,13 @@ def gimbal_to_rotation_matrix(
 
     else:
         # Follow Yaw Mode (Default): Pitch/Roll are horizon-stabilized
-        if use_osd_yaw:
-            absolute_yaw_deg = base_yaw_deg  # Already using OSD.yaw
-        elif add_drone_yaw:
-            absolute_yaw_deg = drone_yaw_deg + yaw_deg
+        if use_gimbal_yaw:
+            if add_drone_yaw:
+                absolute_yaw_deg = drone_yaw_deg + yaw_deg
+            else:
+                absolute_yaw_deg = base_yaw_deg  # Already absolute
         else:
-            absolute_yaw_deg = base_yaw_deg  # Already absolute
+            absolute_yaw_deg = base_yaw_deg  # Already using OSD.yaw (default)
         absolute_pitch_deg = pitch_deg
         absolute_roll_deg = roll_deg
 
@@ -912,7 +914,7 @@ def get_camera_heading_ne(
     yaw_offset_deg: float = 0.0,
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
-    use_osd_yaw: bool = False
+    use_gimbal_yaw: bool = False
 ) -> Tuple[float, float]:
     """
     Get camera look direction projected onto NE (North-East) plane.
@@ -928,7 +930,7 @@ def get_camera_heading_ne(
     R_cam_to_ned = gimbal_to_rotation_matrix(
         pitch_deg, yaw_deg, roll_deg,
         drone_yaw_deg, drone_roll_deg, drone_pitch_deg,
-        gimbal_mode, yaw_offset_deg, magnetic_declination_deg, add_drone_yaw, use_osd_yaw
+        gimbal_mode, yaw_offset_deg, magnetic_declination_deg, add_drone_yaw, use_gimbal_yaw
     )
 
     # Camera look direction is +Z in camera frame (forward)
@@ -1430,7 +1432,7 @@ def process_tracks(
     yaw_offset_deg: float = 0.0,
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
-    use_osd_yaw: bool = False,
+    use_gimbal_yaw: bool = False,
     hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int = 3,
     hdbscan_coherence_weight: float = 10.0,
@@ -1562,7 +1564,7 @@ def process_tracks(
                     yaw_offset_deg=yaw_offset_deg,
                     magnetic_declination_deg=magnetic_declination_deg,
                     add_drone_yaw=add_drone_yaw,
-                    use_osd_yaw=use_osd_yaw
+                    use_gimbal_yaw=use_gimbal_yaw
                 )
 
                 # Get UAV position in NED
@@ -1702,7 +1704,7 @@ def process_tracks(
                     yaw_offset_deg=yaw_offset_deg,
                     magnetic_declination_deg=magnetic_declination_deg,
                     add_drone_yaw=add_drone_yaw,
-                    use_osd_yaw=use_osd_yaw
+                    use_gimbal_yaw=use_gimbal_yaw
                 )
 
                 # Get UAV position in NED
@@ -2012,11 +2014,11 @@ def process_tracks(
         speed_mps = float(np.sqrt(vel_north**2 + vel_east**2))
         speed_mph = speed_mps * 2.23694  # Convert m/s to mph
 
-        # UAV heading: always use telemetry (toggle between GIMBAL.yaw and OSD.yaw based on use_osd_yaw parameter)
-        if use_osd_yaw:
-            heading_deg = float(telem.get('drone_yaw', 0.0))  # OSD.yaw
-        else:
+        # UAV heading: default OSD.yaw (drone heading); opt-in GIMBAL.yaw via use_gimbal_yaw
+        if use_gimbal_yaw:
             heading_deg = float(telem.get('gimbal_yaw', 0.0))  # GIMBAL.yaw
+        else:
+            heading_deg = float(telem.get('drone_yaw', 0.0))  # OSD.yaw (default)
 
         # Get actual timestamp from flight data
         if pd.notna(telem.get('timestamp')):
@@ -2066,7 +2068,7 @@ def create_visualization_video(
     yaw_offset_deg: float = 0.0,
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
-    use_osd_yaw: bool = False
+    use_gimbal_yaw: bool = False
 ):
     """
     Create 2D map video visualization with UAV trajectory and object positions.
@@ -2289,7 +2291,7 @@ def create_visualization_video(
                 yaw_offset_deg=yaw_offset_deg,
                 magnetic_declination_deg=magnetic_declination_deg,
                 add_drone_yaw=add_drone_yaw,
-                use_osd_yaw=use_osd_yaw
+                use_gimbal_yaw=use_gimbal_yaw
             )
             # Scale heading vector for visualization (in mercator units)
             heading_scale = (x_max - x_min) * 0.08  # 8% of map width
@@ -2443,7 +2445,7 @@ def main():
         yaw_offset_deg=args.yaw_offset,
         magnetic_declination_deg=args.magnetic_declination,
         add_drone_yaw=args.add_drone_yaw,
-        use_osd_yaw=args.use_osd_yaw
+        use_gimbal_yaw=args.use_gimbal_yaw
     )
 
     print(f"\nProcessed {len(processed_tracks)} track entries")
@@ -2502,7 +2504,7 @@ def main():
                                    yaw_offset_deg=args.yaw_offset,
                                    magnetic_declination_deg=args.magnetic_declination,
                                    add_drone_yaw=args.add_drone_yaw,
-                                   use_osd_yaw=args.use_osd_yaw)
+                                   use_gimbal_yaw=args.use_gimbal_yaw)
 
     print("\nDone!")
 

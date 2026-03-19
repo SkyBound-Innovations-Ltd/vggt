@@ -53,7 +53,7 @@ class VGGTParameters(BaseModel):
     yaw_offset: float = Field(default=0.0, description="Yaw calibration offset in degrees")
     magnetic_declination: float = Field(default=0.0, description="Magnetic declination in degrees")
     add_drone_yaw: bool = Field(default=False, description="Add drone yaw to gimbal yaw")
-    use_osd_yaw: bool = Field(default=False, description="Use OSD.yaw instead of GIMBAL.yaw")
+    use_gimbal_yaw: bool = Field(default=False, description="Use GIMBAL.yaw instead of OSD.yaw for yaw angle. Default: OSD.yaw (drone heading)")
     timezone: str = Field(default="UTC", description="Timezone of flight log local timestamps (e.g., 'UTC', 'Europe/London')")
     hdbscan_min_cluster_size: int = Field(default=10, description="HDBSCAN min_cluster_size: minimum unique person tracks to form a crowd", ge=2)
     hdbscan_min_samples: int = Field(default=3, description="HDBSCAN min_samples: higher = more conservative clustering", ge=1)
@@ -194,7 +194,7 @@ async def process_video(request: VGGTRequest):
                 yaw_offset=request.parameters.yaw_offset,
                 magnetic_declination=request.parameters.magnetic_declination,
                 add_drone_yaw=request.parameters.add_drone_yaw,
-                use_osd_yaw=request.parameters.use_osd_yaw,
+                use_gimbal_yaw=request.parameters.use_gimbal_yaw,
                 timezone=request.parameters.timezone,
                 hdbscan_min_cluster_size=request.parameters.hdbscan_min_cluster_size,
                 hdbscan_min_samples=request.parameters.hdbscan_min_samples,
@@ -231,7 +231,7 @@ async def process_video_upload(
     yaw_offset: float = Form(0.0),
     magnetic_declination: float = Form(0.0),
     add_drone_yaw: bool = Form(False),
-    use_osd_yaw: bool = Form(False),
+    use_gimbal_yaw: bool = Form(False),
     timezone: str = Form("UTC"),
     # Crowd clustering (HDBSCAN) parameters
     hdbscan_min_cluster_size: int = Form(10),
@@ -300,7 +300,7 @@ async def process_video_upload(
                 yaw_offset=yaw_offset,
                 magnetic_declination=magnetic_declination,
                 add_drone_yaw=add_drone_yaw,
-                use_osd_yaw=use_osd_yaw,
+                use_gimbal_yaw=use_gimbal_yaw,
                 timezone=timezone,
                 hdbscan_min_cluster_size=hdbscan_min_cluster_size,
                 hdbscan_min_samples=hdbscan_min_samples,
@@ -445,7 +445,7 @@ def run_state_estimation(
     yaw_offset: float,
     magnetic_declination: float,
     add_drone_yaw: bool,
-    use_osd_yaw: bool,
+    use_gimbal_yaw: bool,
     timezone: str = "UTC",
     hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int = 3,
@@ -518,7 +518,7 @@ def run_state_estimation(
         yaw_offset_deg=yaw_offset,
         magnetic_declination_deg=magnetic_declination,
         add_drone_yaw=add_drone_yaw,
-        use_osd_yaw=use_osd_yaw,
+        use_gimbal_yaw=use_gimbal_yaw,
         hdbscan_min_cluster_size=hdbscan_min_cluster_size,
         hdbscan_min_samples=hdbscan_min_samples,
         hdbscan_coherence_weight=hdbscan_coherence_weight,
@@ -700,7 +700,7 @@ def run_offline(args):
         yaw_offset=args.yaw_offset,
         magnetic_declination=args.magnetic_declination,
         add_drone_yaw=args.add_drone_yaw,
-        use_osd_yaw=args.use_osd_yaw,
+        use_gimbal_yaw=args.use_gimbal_yaw,
         timezone=args.timezone,
         hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
         hdbscan_min_samples=args.hdbscan_min_samples,
@@ -762,7 +762,7 @@ if __name__ == "__main__":
     off.add_argument("--yaw-offset", type=float, default=0.0, help="Yaw calibration offset in degrees")
     off.add_argument("--magnetic-declination", type=float, default=0.0, help="Magnetic declination in degrees")
     off.add_argument("--add-drone-yaw", action="store_true", help="Add drone heading to gimbal yaw")
-    off.add_argument("--use-osd-yaw", action="store_true", help="Use OSD.yaw instead of GIMBAL.yaw")
+    off.add_argument("--use-gimbal-yaw", action="store_true", help="Use GIMBAL.yaw instead of OSD.yaw for yaw angle. Default: OSD.yaw")
     off.add_argument("--timezone", default="UTC", help="Flight log timezone (default: UTC)")
     # HDBSCAN
     off.add_argument("--hdbscan-min-cluster-size", type=int, default=10, help="HDBSCAN min cluster size (default: 10)")
