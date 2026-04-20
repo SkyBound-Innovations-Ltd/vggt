@@ -1422,6 +1422,9 @@ def _run_segment_subprocess(seg_dir, model_name="facebook/VGGT-1B",
     if save_world_points:
         cmd.append("--save-world-points")
 
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
     print(f"    Running: {' '.join(cmd)}")
     try:
         result = subprocess.run(
@@ -1430,6 +1433,8 @@ def _run_segment_subprocess(seg_dir, model_name="facebook/VGGT-1B",
             text=True,
             stdout=None,              # real-time stdout
             stderr=subprocess.PIPE,   # capture stderr for diagnostics
+            cwd=project_root,
+            env=env,
         )
         return True
     except subprocess.CalledProcessError as e:

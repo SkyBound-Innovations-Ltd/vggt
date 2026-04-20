@@ -1,6 +1,13 @@
 .hydra/
 output/
 ckpt/
+
+# Crowd-service outputs (large preprocessed JSON + fetch cache)
+cache/
+crowd_service/frames.json
+crowd_service/frames.json.gz
+outputs/.osm_cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 **/__pycache__/

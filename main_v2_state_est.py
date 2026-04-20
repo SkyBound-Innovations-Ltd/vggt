@@ -1187,33 +1187,179 @@ def _compute_cluster_area(positions_2d: np.ndarray, min_area_m2: float = 1.0) ->
         return max(area, min_area_m2)
 
 
+# ── HDBSCAN tuning metrics ───────────────────────────────────────────
+
+def compute_crowd_metrics(tracks):
+    """Compute temporal stability proxy metrics from clustered tracks.
+
+    Returns dict with keys: switches, noise_ratio, unique_ids, count_std.
+    No ground-truth labels needed — uses temporal stability proxies.
+    """
+    from collections import defaultdict as _dd
+    track_history = _dd(list)
+    person_count = 0
+
+    for t in tracks:
+        if t.get("class_name") != "person":
+            continue
+        person_count += 1
+        track_history[t["track_id"]].append((t["frame_id"], t.get("crowd_id")))
+
+    if person_count == 0:
+        return {"switches": 0, "noise_ratio": 1.0, "unique_ids": 0, "count_std": 0.0}
+
+    for tid in track_history:
+        track_history[tid].sort(key=lambda x: x[0])
+
+    switches = 0
+    for tid, history in track_history.items():
+        prev_cid = None
+        for _, cid in history:
+            if cid is not None and prev_cid is not None and cid != prev_cid:
+                switches += 1
+            if cid is not None:
+                prev_cid = cid
+
+    noise_count = sum(1 for t in tracks if t.get("class_name") == "person" and t.get("crowd_id") is None)
+    noise_ratio = noise_count / person_count
+
+    unique_ids = len(set(
+        t["crowd_id"] for t in tracks
+        if t.get("class_name") == "person" and t.get("crowd_id") is not None
+    ))
+
+    frame_crowds = _dd(set)
+    for t in tracks:
+        if t.get("class_name") == "person" and t.get("crowd_id") is not None:
+            frame_crowds[t["frame_id"]].add(t["crowd_id"])
+    count_std = float(np.std([len(v) for v in frame_crowds.values()])) if frame_crowds else 0.0
+
+    return {
+        "switches": switches,
+        "noise_ratio": noise_ratio,
+        "unique_ids": unique_ids,
+        "count_std": count_std,
+    }
+
+
+def crowd_composite_cost(metrics, n_tracks):
+    """Composite cost from proxy metrics. Lower = better."""
+    return (
+        (metrics["switches"] / max(n_tracks, 1)) * 1.0
+        + metrics["noise_ratio"] * 50.0
+        + metrics["unique_ids"] * 0.5
+        + metrics["count_std"] * 2.0
+    )
+
+
+# ── Inline HDBSCAN parameter grid (z-score space) ────────────────────
+
+_INLINE_PARAM_GRID = {
+    "coherence_weight": [0.5, 1.0, 1.5, 2.0, 3.0],
+    "min_cluster_size": [5, 8, 10, 15],
+    "min_samples": [2, 3, 5],
+    "cluster_selection_epsilon": [0.3, 0.5, 1.0],
+}
+
+
+def _auto_tune_hdbscan(
+    processed_tracks: List[Dict],
+    n_iter: int = 30,
+    seed: int = 42,
+    fixed_params: Optional[Dict] = None,
+) -> Dict:
+    """Run a small random search over HDBSCAN parameters.
+
+    Returns dict with best parameter values plus '_tuning_cost' and
+    '_tuning_metrics' keys for metadata.
+    """
+    import time as _time
+    _MAX_TUNE_SECONDS = 120
+
+    if fixed_params is None:
+        fixed_params = {}
+
+    n_unique_tracks = len(set(
+        t['track_id'] for t in processed_tracks
+        if t.get('class_name') == 'person' and t.get('pos_ned') is not None
+    ))
+
+    rng = np.random.RandomState(seed)
+    best_cost = float('inf')
+    best_params = None
+    best_metrics = None
+    t0 = _time.monotonic()
+
+    for i in range(n_iter):
+        if _time.monotonic() - t0 > _MAX_TUNE_SECONDS:
+            print(f"  Auto-tune: hit {_MAX_TUNE_SECONDS}s wall-clock limit at iteration {i}")
+            break
+
+        params = {k: rng.choice(v) for k, v in _INLINE_PARAM_GRID.items()}
+        full_params = {**fixed_params, **params}
+
+        for t in processed_tracks:
+            if t.get('class_name') == 'person':
+                t['crowd_id'] = None
+
+        cluster_crowds_per_frame(processed_tracks, **full_params)
+
+        metrics = compute_crowd_metrics(processed_tracks)
+        cost = crowd_composite_cost(metrics, n_unique_tracks)
+
+        if cost < best_cost:
+            best_cost = cost
+            best_params = full_params.copy()
+            best_metrics = metrics.copy()
+
+    # Reset crowd_id — caller will re-run with best params
+    for t in processed_tracks:
+        if t.get('class_name') == 'person':
+            t['crowd_id'] = None
+
+    best_params['_tuning_cost'] = best_cost
+    best_params['_tuning_metrics'] = best_metrics
+    return best_params
+
+
 def cluster_crowds_per_frame(
     processed_tracks: List[Dict],
-    min_cluster_size: int = 10,
+    min_cluster_size: int = 15,
     min_samples: int = 3,
-    coherence_weight: float = 10.0,
+    coherence_weight: float = 1.5,
     max_walking_speed_mps: float = 2.0,
-    cluster_selection_epsilon: float = 2.0,
-    max_match_dist: float = 20.0,
-    ema_alpha: float = 0.4,
-    memory_frames: int = 15,
+    cluster_selection_epsilon: float = 0.5,
+    max_match_dist: float = 5.0,
+    ema_alpha: float = 0.7,
+    memory_frames: int = 30,
+    max_cluster_population: Optional[int] = None,
 ) -> None:
     """
     Apply temporally-stable HDBSCAN crowd clustering to person detections.
+
+    Uses z-score normalisation on the 4D feature vector so that position
+    and velocity dimensions have zero mean and unit variance before
+    clustering.  This makes coherence_weight a true relative importance
+    weight independent of scene extent.
+
+    Feature vector per person per frame:
+        [z(p_N), z(p_E), coherence_weight * z(v_N), coherence_weight * z(v_E)]
+    where z(x) = (x - mean) / std, computed per-frame.
 
     Uses a three-phase approach for stable crowd_id assignment:
 
     Phase 1 — Per-frame physics clustering:
         For each frame, extract person detections with valid pos_ned,
-        build 4D feature vectors [p_N, p_E, w*v_N, w*v_E], and run
-        HDBSCAN independently.  Compute macro-state (centroid, momentum)
-        for each local cluster.
+        build z-score normalised 4D feature vectors, and run HDBSCAN
+        independently.  Compute macro-state (centroid, momentum) for
+        each local cluster (stored in raw NED coordinates).
 
     Phase 2 — Crowd-level Hungarian matching:
         Propagate stable global crowd IDs across frames by matching
         previous-frame clusters to current-frame clusters using
         scipy.optimize.linear_sum_assignment on a cost matrix of
-        spatial + velocity distance.  Unmatched clusters get new IDs.
+        normalised spatial + velocity distance.  Unmatched clusters
+        get new IDs.
 
     Phase 3 — Stamp labels:
         Write the resolved crowd_id onto every person detection.
@@ -1224,19 +1370,24 @@ def cluster_crowds_per_frame(
 
     Args:
         processed_tracks: List of track dicts (mutated in-place).
-        min_cluster_size: HDBSCAN min_cluster_size (default 10).
+        min_cluster_size: HDBSCAN min_cluster_size (default 15).
         min_samples: HDBSCAN min_samples (default 3).
-        coherence_weight: Multiplier on velocity features (default 10.0).
-        max_walking_speed_mps: Max expected walking speed for velocity
-            normalisation (default 2.0).
+        coherence_weight: Multiplier on z-scored velocity features
+            (default 1.5).  1.0 = equal weight with position.
+        max_walking_speed_mps: Max expected walking speed (m/s).
+            Not used for feature normalisation with z-score, but
+            retained for backward compatibility.
         cluster_selection_epsilon: HDBSCAN cluster_selection_epsilon
-            (default 2.0).
-        max_match_dist: Maximum cost for Hungarian match acceptance in
-            metres (default 20.0).  Pairs exceeding this are rejected.
+            in z-score units (default 0.5).
+        max_match_dist: Maximum cost for Hungarian match acceptance
+            in z-score units (default 5.0).
         ema_alpha: EMA smoothing factor for cluster centroid/momentum
-            (default 0.4).  1.0 = no smoothing (raw replacement).
+            (default 0.7).  1.0 = no smoothing (raw replacement).
         memory_frames: Number of frames to remember absent clusters
-            (default 15).  At 10fps this is 1.5s of memory.
+            (default 30).
+        max_cluster_population: Maximum persons per cluster per frame.
+            Clusters exceeding this are split spatially via k-means.
+            None = no limit (default).
     """
     from sklearn.cluster import HDBSCAN
     from scipy.optimize import linear_sum_assignment
@@ -1267,17 +1418,35 @@ def cluster_crowds_per_frame(
 
     sorted_frame_ids = sorted(frames.keys())
 
+    _STD_FLOOR = 1e-6  # Minimum std to prevent division by zero
+
     # ── Helper: run HDBSCAN on one frame and return local clusters ────
     def _cluster_frame(detections):
-        """Return dict: local_label → {'centroid', 'momentum', 'indices'}."""
+        """Return (clusters_dict, norm_stats).
+
+        clusters_dict: local_label → {'centroid', 'momentum', 'indices'}
+        norm_stats: (pos_mean, pos_std, vel_mean, vel_std) or None
+        """
         if len(detections) < min_cluster_size:
-            return {}
+            return {}, None
 
-        positions = np.array([d[1] for d in detections])
-        velocities = np.array([d[2] for d in detections])
+        positions = np.array([d[1] for d in detections])    # [N, 2]
+        velocities = np.array([d[2] for d in detections])   # [N, 2]
 
-        vel_scaled = (velocities / max_walking_speed_mps) * coherence_weight
-        features = np.hstack([positions, vel_scaled])
+        # Z-score normalise position
+        pos_mean = positions.mean(axis=0)
+        pos_std = np.maximum(positions.std(axis=0), _STD_FLOOR)
+        pos_z = (positions - pos_mean) / pos_std
+
+        # Z-score normalise velocity
+        vel_mean = velocities.mean(axis=0)
+        vel_std = np.maximum(velocities.std(axis=0), _STD_FLOOR)
+        vel_z = (velocities - vel_mean) / vel_std
+
+        # Build 4D feature: [z(pos), coherence_weight * z(vel)]
+        features = np.hstack([pos_z, vel_z * coherence_weight])
+
+        norm_stats = (pos_mean, pos_std, vel_mean, vel_std)
 
         clusterer = HDBSCAN(
             min_cluster_size=min_cluster_size,
@@ -1297,7 +1466,33 @@ def cluster_crowds_per_frame(
             clusters[lbl]['vel'].append(detections[i][2])
             clusters[lbl]['indices'].append(detections[i][0])
 
-        # Compute macro-state per cluster
+        # Split oversized clusters via k-means if max_cluster_population is set
+        if max_cluster_population is not None and max_cluster_population > 0:
+            from sklearn.cluster import KMeans
+            split_clusters = {}
+            next_lbl = max(clusters.keys(), default=-1) + 1
+            for lbl, data in clusters.items():
+                n = len(data['indices'])
+                if n <= max_cluster_population:
+                    split_clusters[lbl] = data
+                else:
+                    k = (n + max_cluster_population - 1) // max_cluster_population
+                    pos_arr = np.array(data['pos'])
+                    km = KMeans(n_clusters=k, n_init='auto', random_state=42)
+                    sub_labels = km.fit_predict(pos_arr)
+                    for si in range(k):
+                        mask = sub_labels == si
+                        sub_lbl = lbl if si == 0 else next_lbl
+                        if si > 0:
+                            next_lbl += 1
+                        split_clusters[sub_lbl] = {
+                            'pos': [data['pos'][j] for j in range(n) if mask[j]],
+                            'vel': [data['vel'][j] for j in range(n) if mask[j]],
+                            'indices': [data['indices'][j] for j in range(n) if mask[j]],
+                        }
+            clusters = split_clusters
+
+        # Compute macro-state per cluster (raw NED coordinates)
         result = {}
         for lbl, data in clusters.items():
             result[lbl] = {
@@ -1305,7 +1500,7 @@ def cluster_crowds_per_frame(
                 'momentum': np.median(data['vel'], axis=0),
                 'indices': data['indices'],
             }
-        return result
+        return result, norm_stats
 
     # ── Phase 1 + 2: per-frame clustering with Hungarian matching ─────
     next_global_id = 1
@@ -1318,7 +1513,7 @@ def cluster_crowds_per_frame(
 
     for fid in sorted_frame_ids:
         detections = frames[fid]
-        local_clusters = _cluster_frame(detections)
+        local_clusters, norm_stats = _cluster_frame(detections)
 
         if not local_clusters:
             # No valid clusters this frame — increment ages, prune stale
@@ -1364,11 +1559,13 @@ def cluster_crowds_per_frame(
         n_curr = len(local_list)
         cost = np.empty((n_cand, n_curr), dtype=np.float64)
 
+        # Use current frame's normalisation stats for cost computation
+        _, cur_pos_std, _, cur_vel_std = norm_stats
         for i, (_, entry) in enumerate(candidates):
             for j, lc in enumerate(local_list):
-                spatial = np.linalg.norm(entry['centroid'] - lc['centroid'])
-                vel_d = np.linalg.norm(entry['momentum'] - lc['momentum']) / max_walking_speed_mps
-                cost[i, j] = spatial + coherence_weight * vel_d
+                spatial_z = np.linalg.norm((entry['centroid'] - lc['centroid']) / cur_pos_std)
+                vel_z = np.linalg.norm((entry['momentum'] - lc['momentum']) / cur_vel_std)
+                cost[i, j] = spatial_z + coherence_weight * vel_z
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -1414,6 +1611,38 @@ def cluster_crowds_per_frame(
     for tidx, gid in crowd_assignments.items():
         processed_tracks[tidx]['crowd_id'] = gid
 
+    # ── Phase 4: enforce max_cluster_population post-matching ─────────
+    # The per-frame split in _cluster_frame may be undone by Hungarian
+    # matching that merges sub-clusters back into the same global ID.
+    # This pass splits any per-frame crowd that still exceeds the limit.
+    if max_cluster_population is not None and max_cluster_population > 0:
+        from sklearn.cluster import KMeans
+        from collections import defaultdict as _dd2
+
+        # Group track indices by (frame_id, crowd_id)
+        frame_crowd_idx = _dd2(list)
+        for tidx, gid in crowd_assignments.items():
+            fid = processed_tracks[tidx]['frame_id']
+            frame_crowd_idx[(fid, gid)].append(tidx)
+
+        for (fid, gid), indices in frame_crowd_idx.items():
+            if len(indices) <= max_cluster_population:
+                continue
+            # Split spatially via k-means
+            positions = np.array([
+                processed_tracks[i]['pos_ned'][:2] for i in indices
+            ])
+            k = (len(indices) + max_cluster_population - 1) // max_cluster_population
+            km = KMeans(n_clusters=k, n_init='auto', random_state=42)
+            sub_labels = km.fit_predict(positions)
+            # Keep sub-cluster 0 as the original gid, assign new gids to the rest
+            for si in range(1, k):
+                new_gid = next_global_id
+                next_global_id += 1
+                for j, tidx in enumerate(indices):
+                    if sub_labels[j] == si:
+                        processed_tracks[tidx]['crowd_id'] = new_gid
+
 
 def process_tracks(
     tracks: List[Dict],
@@ -1433,15 +1662,18 @@ def process_tracks(
     magnetic_declination_deg: float = 0.0,
     add_drone_yaw: bool = False,
     use_gimbal_yaw: bool = False,
-    hdbscan_min_cluster_size: int = 10,
+    hdbscan_min_cluster_size: int = 15,
     hdbscan_min_samples: int = 3,
-    hdbscan_coherence_weight: float = 10.0,
+    hdbscan_coherence_weight: float = 1.5,
     hdbscan_max_speed_mps: float = 2.0,
-    hdbscan_cluster_selection_epsilon: float = 2.0,
-    hdbscan_max_match_dist: float = 20.0,
-    hdbscan_ema_alpha: float = 0.4,
-    hdbscan_memory_frames: int = 15,
-) -> List[Dict]:
+    hdbscan_cluster_selection_epsilon: float = 0.5,
+    hdbscan_max_match_dist: float = 5.0,
+    hdbscan_ema_alpha: float = 0.7,
+    hdbscan_memory_frames: int = 30,
+    hdbscan_auto_tune: bool = True,
+    hdbscan_tune_iterations: int = 30,
+    hdbscan_max_cluster_population: Optional[int] = 30,
+) -> Tuple[List[Dict], Dict]:
     """
     Process all tracks and estimate their states.
 
@@ -1915,9 +2147,9 @@ def process_tracks(
 
     # HDBSCAN crowd clustering (per-frame + Hungarian matching)
     print("Running HDBSCAN crowd clustering (per-frame + Hungarian matching) ...")
+    extra_metadata = {}
     try:
-        cluster_crowds_per_frame(
-            processed_tracks,
+        hdbscan_kwargs = dict(
             min_cluster_size=hdbscan_min_cluster_size,
             min_samples=hdbscan_min_samples,
             coherence_weight=hdbscan_coherence_weight,
@@ -1926,7 +2158,35 @@ def process_tracks(
             max_match_dist=hdbscan_max_match_dist,
             ema_alpha=hdbscan_ema_alpha,
             memory_frames=hdbscan_memory_frames,
+            max_cluster_population=hdbscan_max_cluster_population,
         )
+
+        if hdbscan_auto_tune:
+            print(f"  Auto-tuning HDBSCAN parameters ({hdbscan_tune_iterations} iterations) ...")
+            tuned = _auto_tune_hdbscan(
+                processed_tracks,
+                n_iter=hdbscan_tune_iterations,
+                fixed_params={
+                    'max_match_dist': hdbscan_max_match_dist,
+                    'ema_alpha': hdbscan_ema_alpha,
+                    'memory_frames': hdbscan_memory_frames,
+                    'max_walking_speed_mps': hdbscan_max_speed_mps,
+                },
+            )
+            tuning_cost = tuned.pop('_tuning_cost')
+            tuning_metrics = tuned.pop('_tuning_metrics')
+            hdbscan_kwargs.update(tuned)
+            extra_metadata['hdbscan_tuning'] = {
+                'auto_tuned': True,
+                'iterations': hdbscan_tune_iterations,
+                'best_cost': round(tuning_cost, 3),
+                'best_metrics': tuning_metrics,
+                'tuned_params': {k: v for k, v in tuned.items() if k in _INLINE_PARAM_GRID},
+            }
+            print(f"  Auto-tune best cost: {tuning_cost:.2f}")
+            print(f"  Tuned params: {extra_metadata['hdbscan_tuning']['tuned_params']}")
+
+        cluster_crowds_per_frame(processed_tracks, **hdbscan_kwargs)
         n_clustered = sum(1 for t in processed_tracks if t.get('crowd_id') is not None)
         unique_crowds = set(
             (t['frame_id'], t['crowd_id'])
@@ -2056,7 +2316,7 @@ def process_tracks(
     all_tracks = uav_tracks + processed_tracks
     all_tracks.sort(key=lambda x: (x['frame_id'], x['track_id']))
 
-    return all_tracks
+    return all_tracks, extra_metadata
 
 
 def create_visualization_video(

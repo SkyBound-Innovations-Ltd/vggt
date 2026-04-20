@@ -692,6 +692,14 @@ def process_tracks_no_flight(
     for obj_id in tracks_by_id:
         tracks_by_id[obj_id].sort(key=lambda x: x['frame_id'])
 
+    # Build frame_id to depth-map index mapping
+    # Handles cases where frame_ids don't start at 0 (e.g., sub-clips)
+    all_frame_ids = sorted(set(t['frame_id'] for t in tracks))
+    min_frame_id = all_frame_ids[0]
+    frame_id_to_idx = {fid: i for i, fid in enumerate(range(min_frame_id, min_frame_id + len(depth_maps)))}
+    print(f"Frame ID range: {min_frame_id} - {max(all_frame_ids)}, "
+          f"depth maps: {len(depth_maps)}, offset: {min_frame_id}")
+
     print(f"Processing {len(tracks_by_id)} unique tracks")
 
     processed_tracks = []
@@ -708,12 +716,13 @@ def process_tracks_no_flight(
             frame_id = track['frame_id']
             bbox = track['bbox']
 
-            if frame_id >= len(depth_maps):
+            idx = frame_id_to_idx.get(frame_id)
+            if idx is None or idx >= len(depth_maps):
                 continue
 
-            depth_map = depth_maps[frame_id].squeeze()  # [H, W]
-            K = intrinsics[min(frame_id, len(intrinsics) - 1)]
-            ext = extrinsics[min(frame_id, len(extrinsics) - 1)]
+            depth_map = depth_maps[idx].squeeze()  # [H, W]
+            K = intrinsics[min(idx, len(intrinsics) - 1)]
+            ext = extrinsics[min(idx, len(extrinsics) - 1)]
 
             # Rescale bbox
             bbox_scaled = rescale_bbox(bbox, sx, sy)
@@ -816,7 +825,8 @@ def process_tracks_no_flight(
 def create_camera_tracks(
     vggt_outputs: Dict,
     fps: float,
-    scale_hint: Optional[float] = None
+    scale_hint: Optional[float] = None,
+    frame_id_offset: int = 0
 ) -> List[Dict]:
     """
     Create camera/UAV track entries from VGGT extrinsics in NED coordinates.
@@ -824,6 +834,9 @@ def create_camera_tracks(
     The first frame defines the origin of the NED coordinate system.
     - Camera position at frame 0 is approximately [0, 0, 0]
     - Subsequent positions are relative to frame 0
+
+    Args:
+        frame_id_offset: Added to 0-based index to produce original frame_ids.
 
     Returns track entries for track_id=0 (camera position each frame).
     """
@@ -875,7 +888,7 @@ def create_camera_tracks(
             coord_system = "ned_drone_relative"
 
         camera_track = {
-            'frame_id': frame_id,
+            'frame_id': frame_id + frame_id_offset,
             'track_id': 0,  # Reserved for camera/UAV
             'bbox': None,
             'confidence': None,
@@ -984,11 +997,11 @@ def create_visualization_video(
     north_min -= padding
     north_max += padding
 
-    # Determine frame range
-    if num_frames is None:
-        max_frame = max(tracks_by_frame.keys())
-    else:
-        max_frame = num_frames - 1
+    # Determine frame range (use actual frame_ids, not 0-based)
+    min_frame = min(tracks_by_frame.keys())
+    max_frame = max(tracks_by_frame.keys())
+    if num_frames is not None:
+        max_frame = min_frame + num_frames - 1
 
     # Create temporary directory for frames
     temp_dir = tempfile.mkdtemp()
@@ -997,7 +1010,7 @@ def create_visualization_video(
     # Camera trajectory
     camera_positions = []
 
-    for frame_idx in range(max_frame + 1):
+    for frame_idx in range(min_frame, max_frame + 1):
         fig, ax = plt.subplots(figsize=(10, 10), facecolor='white')
         ax.set_facecolor('#f0f0f0')
 
@@ -1165,11 +1178,13 @@ def main():
         scale_hint=args.scale_hint
     )
 
-    # Create camera tracks
+    # Create camera tracks (preserve original frame_id offset)
+    min_frame_id = min(t['frame_id'] for t in tracks) if tracks else 0
     camera_tracks = create_camera_tracks(
         vggt_outputs=vggt_outputs,
         fps=args.fps,
-        scale_hint=args.scale_hint
+        scale_hint=args.scale_hint,
+        frame_id_offset=min_frame_id
     )
 
     # Combine and sort

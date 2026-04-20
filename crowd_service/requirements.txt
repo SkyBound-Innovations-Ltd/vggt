@@ -1,0 +1,5 @@
+osmnx>=1.9
+shapely>=2.0
+geopandas>=0.14
+rtree>=1.0
+networkx>=3.0

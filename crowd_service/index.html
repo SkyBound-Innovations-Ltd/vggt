@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crowd Viewer — VGGT</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+  <style>
+    :root { --bar-h: 96px; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, system-ui, sans-serif; }
+    #map { position: fixed; top: 0; left: 0; right: 0; bottom: var(--bar-h); }
+    #controls {
+      position: fixed; bottom: 0; left: 0; right: 0; height: var(--bar-h);
+      background: rgba(255,255,255,0.96); border-top: 1px solid #ddd;
+      padding: 10px 14px; display: flex; gap: 12px; align-items: center;
+      box-shadow: 0 -2px 10px rgba(0,0,0,0.08);
+    }
+    #controls button {
+      padding: 8px 16px; font-size: 14px; border: 1px solid #999; background: #fff;
+      border-radius: 4px; cursor: pointer;
+    }
+    #controls button:hover { background: #f2f2f2; }
+    #seek { flex: 1; min-width: 150px; }
+    #frame-info { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+                  white-space: nowrap; min-width: 270px; color: #333; }
+    #legend {
+      position: fixed; top: 12px; right: 12px; max-width: 260px; max-height: 60vh;
+      overflow-y: auto; background: rgba(255,255,255,0.95); padding: 10px 12px;
+      border-radius: 6px; font-size: 12px; line-height: 1.4;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+    #legend b { display: block; margin-bottom: 6px; }
+    #legend .swatch { display: inline-block; width: 18px; height: 12px; margin-right: 6px; vertical-align: middle; border: 1px solid #aaa; }
+    #tooltip {
+      position: fixed; display: none; pointer-events: none;
+      background: rgba(20,20,20,0.92); color: #fff; padding: 6px 9px;
+      border-radius: 4px; font-size: 12px; line-height: 1.35;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2); max-width: 260px; z-index: 2000;
+      transform: translate(8px, 8px);
+    }
+    .pill { background: #f0f0f0; border-radius: 10px; padding: 2px 8px; font-size: 11px; }
+    label { font-size: 13px; user-select: none; }
+    #loader {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(255,255,255,0.85); font-size: 15px; color: #333; z-index: 1000;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="legend"></div>
+  <div id="tooltip"></div>
+  <div id="controls">
+    <button id="play" title="Play / Pause (space)">▶ Play</button>
+    <input id="seek" type="range" min="0" max="0" value="0" step="1">
+    <label>Speed
+      <select id="fps-select">
+        <option value="10">10 fps</option>
+        <option value="24" selected>24 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="mode-density"> Density</label>
+    <label><input type="checkbox" id="show-arrows" checked> Arrows</label>
+    <label><input type="checkbox" id="show-hulls" checked> Hulls</label>
+    <div id="frame-info">Frame – / –</div>
+  </div>
+  <div id="loader">Loading frames.json…</div>
+  <script src="viewer.js"></script>
+</body>
+</html>

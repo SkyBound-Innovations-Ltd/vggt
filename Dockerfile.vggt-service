@@ -1,37 +1,39 @@
-# VGGT-P Service Docker Image
+# VGGT-P XP Service (v3.1) Docker Image
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
-# Set working directory
 WORKDIR /workspace
 
-# Install system dependencies
+# System dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsm6 \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+COPY requirements_service.txt /workspace/
+RUN pip install --no-cache-dir -r requirements_service.txt
 
 # Copy VGGT package and service files
 COPY vggt/ /workspace/vggt/
-COPY main.py /workspace/
+COPY main_v3_1_service_XP.py /workspace/
+COPY main_v5_global_scale.py /workspace/
 COPY main_v2_state_est.py /workspace/
-COPY main_v3_service.py /workspace/
-COPY requirements_service.txt /workspace/
+COPY scripts/infer_segment.py /workspace/scripts/
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements_service.txt
+# Pre-download VGGT-1B model weights into image
+ENV HF_HOME=/workspace/.cache/huggingface
+RUN python -c "from vggt.models.vggt import VGGT; VGGT.from_pretrained('facebook/VGGT-1B')" || echo "Model pre-download skipped (will download on first request)"
 
-# Pre-download VGGT model (optional, speeds up first request)
-RUN python -c "from vggt.models.vggt import VGGT; VGGT.from_pretrained('facebook/VGGT-1B')" || true
+# Port (overridable via SERVICE_PORT env var)
+EXPOSE 8003
 
-# Expose port
-EXPOSE 8000
-
-# Health check
+# Health check against the routed endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8003/vggt_p/health || exit 1
 
 # Run service
-CMD ["uvicorn", "main_v3_service:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main_v3_1_service_XP:app", "--host", "0.0.0.0", "--port", "8003", "--timeout-keep-alive", "300"]

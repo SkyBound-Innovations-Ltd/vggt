@@ -26,93 +26,24 @@ import numpy as np
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from main_v2_state_est import cluster_crowds_per_frame
+from main_v2_state_est import (
+    cluster_crowds_per_frame,
+    compute_crowd_metrics as compute_metrics,
+    crowd_composite_cost as composite_cost,
+)
 
 
-# ── Parameter search space ────────────────────────────────────────────
+# ── Parameter search space (z-score normalised space) ─────────────────
 
 PARAM_GRID = {
-    "coherence_weight": [5, 10, 15, 20],
+    "coherence_weight": [0.5, 1.0, 1.5, 2.0, 3.0, 5.0],
     "min_cluster_size": [5, 8, 10, 15],
     "min_samples": [2, 3, 5],
-    "cluster_selection_epsilon": [1, 2, 3, 5],
-    "max_match_dist": [15, 20, 30, 50],
+    "cluster_selection_epsilon": [0.3, 0.5, 0.7, 1.0],
+    "max_match_dist": [3, 5, 8, 10],
     "ema_alpha": [0.2, 0.3, 0.4, 0.5, 0.7],
     "memory_frames": [5, 10, 15, 20, 30],
 }
-
-
-# ── Proxy metrics ─────────────────────────────────────────────────────
-
-def compute_metrics(tracks):
-    """Compute temporal stability proxy metrics from clustered tracks."""
-    # Build per-track crowd_id history
-    track_history = defaultdict(list)  # track_id -> [(frame_id, crowd_id)]
-    person_count = 0
-
-    for t in tracks:
-        if t.get("class_name") != "person":
-            continue
-        person_count += 1
-        tid = t["track_id"]
-        fid = t["frame_id"]
-        cid = t.get("crowd_id")
-        track_history[tid].append((fid, cid))
-
-    if person_count == 0:
-        return {"switches": 0, "noise_ratio": 1.0, "unique_ids": 0, "count_std": 0.0}
-
-    # Sort each track by frame_id
-    for tid in track_history:
-        track_history[tid].sort(key=lambda x: x[0])
-
-    # Switches: total crowd_id changes across all tracks
-    switches = 0
-    for tid, history in track_history.items():
-        prev_cid = None
-        for _, cid in history:
-            if cid is not None and prev_cid is not None and cid != prev_cid:
-                switches += 1
-            if cid is not None:
-                prev_cid = cid
-
-    # Noise ratio: fraction of person detections with crowd_id=None
-    noise_count = sum(1 for t in tracks if t.get("class_name") == "person" and t.get("crowd_id") is None)
-    noise_ratio = noise_count / person_count
-
-    # Unique IDs
-    unique_ids = len(set(
-        t["crowd_id"] for t in tracks
-        if t.get("class_name") == "person" and t.get("crowd_id") is not None
-    ))
-
-    # Count std: std of crowds-per-frame
-    frame_crowds = defaultdict(set)
-    for t in tracks:
-        if t.get("class_name") == "person" and t.get("crowd_id") is not None:
-            frame_crowds[t["frame_id"]].add(t["crowd_id"])
-    if frame_crowds:
-        counts = [len(v) for v in frame_crowds.values()]
-        count_std = float(np.std(counts))
-    else:
-        count_std = 0.0
-
-    return {
-        "switches": switches,
-        "noise_ratio": noise_ratio,
-        "unique_ids": unique_ids,
-        "count_std": count_std,
-    }
-
-
-def composite_cost(metrics, n_tracks):
-    """Compute composite cost from proxy metrics."""
-    return (
-        (metrics["switches"] / max(n_tracks, 1)) * 1.0
-        + metrics["noise_ratio"] * 50.0
-        + metrics["unique_ids"] * 0.5
-        + metrics["count_std"] * 2.0
-    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────

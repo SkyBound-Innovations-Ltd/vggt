@@ -122,7 +122,7 @@ _FALLBACK_COLOR = '#AAAAAA'
 
 
 def generate_crowd_colors(crowd_ids):
-    """Generate a distinct color for each crowd_id using golden-angle HSL rotation.
+    """Generate a distinct color for each crowd_id using a high-contrast palette.
 
     Args:
         crowd_ids: iterable of integer crowd ids
@@ -130,14 +130,25 @@ def generate_crowd_colors(crowd_ids):
     Returns:
         dict[int, str] mapping crowd_id → hex color string
     """
+    # Hand-picked high-contrast palette (colourblind-friendly where possible)
+    PALETTE = [
+        '#E63946',  # red
+        '#1D9BF0',  # blue
+        '#2DC653',  # green
+        '#F77F00',  # orange
+        '#9B5DE5',  # purple
+        '#00BBF9',  # cyan
+        '#FEE440',  # yellow
+        '#F15BB5',  # pink
+        '#00F5D4',  # teal
+        '#8AC926',  # lime
+        '#FF6B6B',  # coral
+        '#4361EE',  # royal blue
+    ]
     sorted_ids = sorted(set(crowd_ids))
-    golden_angle = 137.508  # degrees
     colors = {}
     for i, cid in enumerate(sorted_ids):
-        hue = (i * golden_angle) % 360 / 360.0
-        r, g, b = colorsys.hls_to_rgb(hue, 0.55, 0.85)
-        colors[cid] = '#{:02X}{:02X}{:02X}'.format(
-            int(r * 255), int(g * 255), int(b * 255))
+        colors[cid] = PALETTE[i % len(PALETTE)]
     return colors
 
 
@@ -728,7 +739,7 @@ def main():
     show_arrows = not args.no_arrows
 
     # Parse --video selection
-    ALL_VIDEOS = {'map', 'crowd', 'density'}
+    ALL_VIDEOS = {'map', 'crowd', 'density', 'uav'}
     if args.video:
         selected = {v.strip().lower() for v in args.video.split(',')}
         unknown = selected - ALL_VIDEOS
@@ -747,6 +758,7 @@ def main():
     map_video_path = os.path.join(out_dir, f'{stem}_map.mp4')
     crowd_video_path = os.path.join(out_dir, f'{stem}_crowd.mp4')
     density_video_path = os.path.join(out_dir, f'{stem}_density.mp4')
+    uav_video_path = os.path.join(out_dir, f'{stem}_uav.mp4')
 
     print(f"Loading {json_path} ...")
     tracks_by_frame, metadata, uav_tracks = load_data(json_path)
@@ -904,6 +916,46 @@ def main():
             print("  Compiling video ...")
             compile_video(temp_dir, density_video_path, fps)
             saved_paths.append(density_video_path)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # -----------------------------------------------------------------------
+    # Video 4: UAV-only (drone trace + heading sector, no object markers)
+    # -----------------------------------------------------------------------
+    if 'uav' in selected:
+        print(f"\n--- Generating UAV trace + heading video ({n_frames} frames) ---")
+        temp_dir = tempfile.mkdtemp(prefix='vggt_viz_uav_')
+        try:
+            for frame_idx in range(n_frames):
+                fig, ax = plt.subplots(figsize=figsize)
+                _render_base(ax, bounds, uav_x, uav_y, frame_idx, figsize)
+                _draw_heading(ax, uav_x, uav_y, uav_tracks, frame_idx, bounds)
+
+                # Altitude + heading info text
+                cur = min(frame_idx, len(uav_tracks) - 1)
+                alt = uav_tracks[cur].get('alt', 0)
+                hdg = uav_tracks[cur].get('heading_deg', 0)
+                spd = uav_tracks[cur].get('speed_mph', 0)
+                ax.text(0.02, 0.98,
+                        f'Frame: {frame_idx} | Alt: {alt:.1f}m | Hdg: {hdg:.1f}° | Speed: {spd:.1f}mph',
+                        transform=ax.transAxes, fontsize=12, fontweight='bold',
+                        verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+                ax.set_xlabel('Easting (m)', fontsize=10)
+                ax.set_ylabel('Northing (m)', fontsize=10)
+                ax.set_title('UAV Trajectory and Heading', fontsize=12, fontweight='bold')
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(temp_dir, f'frame_{frame_idx:05d}.png'),
+                            dpi=dpi, facecolor='white')
+                plt.close(fig)
+                if (frame_idx + 1) % 50 == 0 or frame_idx == max_frame:
+                    print(f"    {frame_idx + 1}/{n_frames} frames")
+
+            print("  Compiling video ...")
+            compile_video(temp_dir, uav_video_path, fps)
+            saved_paths.append(uav_video_path)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
