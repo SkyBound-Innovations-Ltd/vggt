@@ -1,11 +1,15 @@
 """
-OSM street-snapping helpers for street-partitioned crowd clustering.
+OSM street polygon helpers for street-partitioned crowd clustering.
 
-One OSM graph is fetched per scene (bbox + network_type) and cached as GraphML
-under `outputs/.osm_cache/{sha1}.graphml`. Each pedestrian track is snapped
-once — using the median of its (lat, lon) over its full timeline — to the
-nearest OSM edge; tracks farther than `lateral_tol_m` from every edge fall
-into the `__unassigned__` bucket.
+Responsibilities:
+- Fetch named pedestrian-area polygons (plazas, squares, etc.) from OSM via
+  Overpass, cached as GeoPackage under `outputs/.osm_cache/polys_{sha}.gpkg`.
+- Load user-supplied polygons defined either by OSM node id lists (one or
+  more closed rings per street) or by auto-buffering an OSM LineString with
+  a given name.
+- Per-row point-in-polygon snap (`snap_persons_polygon_only`). Each person
+  detection is assigned to the smallest polygon containing its (lat, lon)
+  — no distance tolerance, no edge fallback.
 
 Uses osmnx >= 2.0 API: graph_from_bbox(bbox=(west, south, east, north)).
 """
@@ -28,7 +32,6 @@ except ImportError:
     HAS_OSMNX = False
 
 UNASSIGNED_KEY = "__unassigned__"
-LATERAL_TOL_M_DEFAULT = 12.0
 
 
 def compute_track_medians(tracks) -> dict[int, tuple[float, float]]:
@@ -475,79 +478,6 @@ def snap_tracks_polygon_only(
     return out
 
 
-def snap_tracks_polygon_first(
-    track_medians: dict[int, tuple[float, float]],
-    G_proj,
-    polygons_gdf,
-    *,
-    lateral_tol_m: float = LATERAL_TOL_M_DEFAULT,
-    name_overrides: Optional[dict] = None,
-) -> dict[int, tuple[Optional[str], float]]:
-    """Polygon-first snap: point-in-polygon against named pedestrian areas,
-    then fall back to nearest-edge snap (with lateral_tol) for the rest.
-
-    Returns {track_id: (name_or_None, distance_m)}. For polygon-hit tracks,
-    distance is 0.0 by convention.
-    """
-    if not HAS_OSMNX:
-        raise RuntimeError("osmnx is not installed")
-
-    import pyproj
-    from shapely.geometry import Point
-    from shapely.strtree import STRtree
-
-    out: dict[int, tuple[Optional[str], float]] = {}
-    overrides = name_overrides or {}
-
-    tids = list(track_medians.keys())
-    if not tids:
-        return out
-    lats = np.array([track_medians[t][0] for t in tids])
-    lons = np.array([track_medians[t][1] for t in tids])
-
-    graph_crs = G_proj.graph.get("crs", "EPSG:4326")
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", graph_crs, always_xy=True)
-    xs, ys = transformer.transform(lons, lats)
-
-    # ── Polygon-first pass ──────────────────────────────────────────────
-    hit_idx_set = set()
-    if polygons_gdf is not None and not polygons_gdf.empty:
-        # polygons_gdf should already be in graph CRS
-        polys = list(polygons_gdf.geometry.values)
-        names = list(polygons_gdf["name"].astype(str).values)
-        tree = STRtree(polys)
-        for i, (x, y) in enumerate(zip(xs, ys)):
-            pt = Point(x, y)
-            cands = tree.query(pt)
-            # STRtree.query returns either indices (shapely >= 2) or geometries (< 2);
-            # normalise to indices
-            for c in cands:
-                j = int(c) if isinstance(c, (int, np.integer)) else polys.index(c)
-                if polys[j].contains(pt):
-                    name = names[j]
-                    out[tids[i]] = (overrides.get(name, name), 0.0)
-                    hit_idx_set.add(i)
-                    break
-
-    # ── Edge-snap fallback for the rest ─────────────────────────────────
-    rest = [(i, tids[i]) for i in range(len(tids)) if i not in hit_idx_set]
-    if rest:
-        rx = np.array([xs[i] for i, _ in rest])
-        ry = np.array([ys[i] for i, _ in rest])
-        edges, dists = ox.distance.nearest_edges(G_proj, X=rx, Y=ry, return_dist=True)
-        for (i, tid), (u, v, k), d in zip(rest, edges, dists):
-            d = float(d)
-            if d > lateral_tol_m:
-                out[tid] = (None, d)
-                continue
-            name = _edge_name(G_proj, u, v, k)
-            if name in overrides:
-                name = overrides[name]
-            out[tid] = (name, d)
-
-    return out
-
-
 def compute_bbox(tracks, margin_deg: float = 0.0015) -> tuple[float, float, float, float]:
     """Return (min_lat, min_lon, max_lat, max_lon) with a lat/lon-degree margin."""
     lats, lons = [], []
@@ -575,122 +505,6 @@ def _cache_key(bbox, network_type) -> str:
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
-def load_or_fetch_graph(
-    bbox: tuple[float, float, float, float],
-    *,
-    network_type: str = "all",
-    cache_dir: Path | str = "outputs/.osm_cache",
-    force_fetch: bool = False,
-    simplify: bool = False,
-):
-    """Load cached or fetch an OSM graph for the given bbox, then project to UTM.
-
-    `simplify=False` (default): preserve every OSM way. osmnx's graph
-    simplification can drop short footway ways entirely in dense urban
-    tilings (e.g. "Millennium Walk" in the Cardiff scene), which is fatal
-    for street-level crowd partitioning. Keeping the raw graph means ~3×
-    more edges but correct coverage.
-    """
-    if not HAS_OSMNX:
-        raise RuntimeError("osmnx is not installed; pip install -r crowd_service/requirements.txt")
-
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    # Include simplify flag in the cache key so raw vs simplified don't collide
-    cache_key = _cache_key(bbox, f"{network_type}_simp{int(simplify)}")
-    cache_path = cache_dir / f"{cache_key}.graphml"
-
-    if cache_path.exists() and not force_fetch:
-        print(f"  OSM cache hit: {cache_path.name}")
-        G = ox.load_graphml(cache_path)
-    else:
-        min_lat, min_lon, max_lat, max_lon = bbox
-        # osmnx 2.x: bbox = (west, south, east, north) == (min_lon, min_lat, max_lon, max_lat)
-        print(f"  Fetching OSM graph: {network_type} network, "
-              f"bbox=({min_lat:.5f},{min_lon:.5f},{max_lat:.5f},{max_lon:.5f}), "
-              f"simplify={simplify} …")
-        G = ox.graph_from_bbox(
-            bbox=(min_lon, min_lat, max_lon, max_lat),
-            network_type=network_type,
-            simplify=simplify,
-        )
-        ox.save_graphml(G, cache_path)
-        print(f"  Saved graph → {cache_path}  ({len(G.nodes)} nodes, {len(G.edges)} edges)")
-
-    G_proj = ox.projection.project_graph(G)
-    return G_proj
-
-
-def _edge_name(G, u, v, k) -> Optional[str]:
-    """Resolve a human-friendly name for an OSM edge; fall back to ref / osmid."""
-    attrs = G.edges[u, v, k]
-    name = attrs.get("name")
-    if isinstance(name, list):
-        name = name[0] if name else None
-    if name:
-        return str(name).strip() or None
-    ref = attrs.get("ref")
-    if isinstance(ref, list):
-        ref = ref[0] if ref else None
-    if ref:
-        return f"ref:{ref}"
-    osmid = attrs.get("osmid")
-    if isinstance(osmid, list):
-        osmid = osmid[0] if osmid else None
-    if osmid is not None:
-        return f"osmid:{osmid}"
-    return None
-
-
-def snap_tracks(
-    track_medians: dict[int, tuple[float, float]],
-    G_proj,
-    *,
-    lateral_tol_m: float = LATERAL_TOL_M_DEFAULT,
-    name_overrides: Optional[dict] = None,
-) -> dict[int, tuple[Optional[str], float]]:
-    """Snap each track's median point to the nearest OSM edge.
-
-    Returns {track_id: (street_name_or_None, distance_m)}.
-    Tracks farther than `lateral_tol_m` get (None, dist) → unassigned bucket.
-
-    osmnx 2.x `nearest_edges` does NOT auto-transform — query coords must be
-    in the graph's CRS. We project the tracks' (lon, lat) into the graph CRS
-    (a UTM zone) before lookup so `dist` comes back in metres.
-    """
-    if not HAS_OSMNX:
-        raise RuntimeError("osmnx is not installed")
-    if not track_medians:
-        return {}
-
-    import pyproj
-
-    tids = list(track_medians.keys())
-    lats = np.array([track_medians[t][0] for t in tids])
-    lons = np.array([track_medians[t][1] for t in tids])
-
-    graph_crs = G_proj.graph.get("crs", "EPSG:4326")
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", graph_crs, always_xy=True)
-    xs, ys = transformer.transform(lons, lats)
-
-    edges, dists = ox.distance.nearest_edges(G_proj, X=xs, Y=ys, return_dist=True)
-    # edges: ndarray of (u, v, k) tuples; dists: metres because graph is projected.
-
-    overrides = name_overrides or {}
-
-    out: dict[int, tuple[Optional[str], float]] = {}
-    for tid, (u, v, k), d in zip(tids, edges, dists):
-        d = float(d)
-        if d > lateral_tol_m:
-            out[tid] = (None, d)
-            continue
-        name = _edge_name(G_proj, u, v, k)
-        if name in overrides:
-            name = overrides[name]
-        out[tid] = (name, d)
-    return out
-
-
 def build_street_index_map(
     track_street: dict[int, tuple[Optional[str], float]],
 ) -> dict[str, int]:
@@ -704,23 +518,3 @@ def build_street_index_map(
     return {UNASSIGNED_KEY: 0, **{n: i + 1 for i, n in enumerate(sorted(names))}}
 
 
-def stamp_tracks_with_street(
-    tracks,
-    track_street: dict[int, tuple[Optional[str], float]],
-    street_index_map: dict[str, int],
-) -> None:
-    """Mutate person-track rows with street_key / street_index / street_dist_m."""
-    for t in tracks:
-        if t.get("class_name") != "person":
-            continue
-        tid = t.get("track_id")
-        if tid not in track_street:
-            t["street_key"] = UNASSIGNED_KEY
-            t["street_index"] = street_index_map[UNASSIGNED_KEY]
-            t["street_dist_m"] = None
-            continue
-        name, dist = track_street[tid]
-        key = name if name is not None else UNASSIGNED_KEY
-        t["street_key"] = key
-        t["street_index"] = street_index_map.get(key, 0)
-        t["street_dist_m"] = round(dist, 2) if dist is not None else None

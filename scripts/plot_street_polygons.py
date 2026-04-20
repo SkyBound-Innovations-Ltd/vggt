@@ -107,22 +107,86 @@ def main():
     street_to_color = {name: pal[i] for i, name in enumerate(street_names)}
     street_to_color[UNASSIGNED_KEY] = (0.6, 0.6, 0.6)
 
-    # ── Project polygons + medians to Web Mercator for contextily basemap ─
+    # ── Project polygons + per-track dominant-polygon coords ────────────
     polys_wm = polys.to_crs(epsg=3857)
 
-    medians = compute_track_medians(tracks)
-    track_street_idx: dict[int, int] = {}
+    DOMINANT_THRESH = 0.80  # residency cut-off for "cleanly in polygon"
+
+    # Build per-track: list of (frame_id, street_index, lat, lon)
+    from collections import Counter, defaultdict
+    track_frames: dict[int, list[tuple]] = defaultdict(list)
     for t in tracks:
-        if t.get("class_name") == "person":
-            tid = t["track_id"]
-            if tid not in track_street_idx and t.get("street_index") is not None:
-                track_street_idx[tid] = int(t["street_index"])
+        if t.get("class_name") != "person":
+            continue
+        lat, lon = t.get("lat"), t.get("lon")
+        si = t.get("street_index")
+        if lat is None or lon is None or si is None:
+            continue
+        track_frames[t["track_id"]].append((float(lat), float(lon), int(si)))
+
+    # For each track: dominant polygon (mode of si), residency, median of
+    # frames INSIDE the dominant polygon (fall back to all-frame median when
+    # dominant-polygon frames < 3)
+    track_info: list[dict] = []  # each dict → tid, dominant_si, frac_dom,
+                                 #              frac_2nd, si_2nd, lat, lon,
+                                 #              cross_segment
+    for tid, frames_list in track_frames.items():
+        n = len(frames_list)
+        if n == 0:
+            continue
+        si_counter = Counter(si for _, _, si in frames_list)
+        top = si_counter.most_common(2)
+        dom_si, dom_n = top[0]
+        frac_dom = dom_n / n
+        if len(top) > 1:
+            si_2nd, second_n = top[1]
+            frac_2nd = second_n / n
+        else:
+            si_2nd, frac_2nd = None, 0.0
+
+        in_dom = [(la, lo) for la, lo, si in frames_list if si == dom_si]
+        if len(in_dom) >= 3:
+            med_lat = float(np.median([la for la, _ in in_dom]))
+            med_lon = float(np.median([lo for _, lo in in_dom]))
+        else:
+            med_lat = float(np.median([la for la, _, _ in frames_list]))
+            med_lon = float(np.median([lo for _, lo, _ in frames_list]))
+
+        track_info.append({
+            "tid": tid,
+            "dominant_si": int(dom_si),
+            "frac_dom": frac_dom,
+            "si_2nd": si_2nd,
+            "frac_2nd": frac_2nd,
+            "lat": med_lat,
+            "lon": med_lon,
+            "cross_segment": frac_dom < DOMINANT_THRESH,
+        })
+
     transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    tids, lats, lons, idxs = [], [], [], []
-    for tid, (la, lo) in medians.items():
-        tids.append(tid); lats.append(la); lons.append(lo)
-        idxs.append(track_street_idx.get(tid, 0))
+    tids = [ti["tid"] for ti in track_info]
+    lats = [ti["lat"] for ti in track_info]
+    lons = [ti["lon"] for ti in track_info]
+    idxs = [ti["dominant_si"] for ti in track_info]
     xs, ys = transformer.transform(lons, lats)
+
+    # ── Residency QA report (stdout) ────────────────────────────────────
+    n_tracks = len(track_info)
+    clean = [ti for ti in track_info if not ti["cross_segment"]]
+    cross = [ti for ti in track_info if ti["cross_segment"]]
+    avg_max_res = float(np.mean([ti["frac_dom"] for ti in cross])) if cross else 0.0
+    print("\n=== residency QA ===")
+    print(f"  n_tracks                  = {n_tracks}")
+    print(f"  cleanly_in_polygon (≥{int(DOMINANT_THRESH * 100)}%) = {len(clean)}")
+    print(f"  cross_segment  (<{int(DOMINANT_THRESH * 100)}%)     = {len(cross)}")
+    if cross:
+        print(f"    avg_max_residency       = {avg_max_res:.2f}")
+        print(f"    top mismatches (tid, dominant, 2nd, frac_dom, frac_2nd):")
+        for ti in sorted(cross, key=lambda r: r["frac_dom"])[:15]:
+            dom_name = idx_to_name.get(ti["dominant_si"], f"si={ti['dominant_si']}")
+            snd_name = idx_to_name.get(ti["si_2nd"], "—") if ti["si_2nd"] is not None else "—"
+            print(f"      tid={ti['tid']:<5} {dom_name[:22]:<22} "
+                  f"({ti['frac_dom']:.2f}) → {snd_name[:22]:<22} ({ti['frac_2nd']:.2f})")
 
     # ── Figure ───────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=tuple(args.figsize))
@@ -163,11 +227,27 @@ def main():
             bbox=dict(boxstyle="round,pad=0.18", fc=(1, 1, 1, 0.85), ec="black", lw=0.5),
         )
 
-    # Track medians
+    # Track medians — split by residency flag: circles for clean tracks,
+    # diamonds with red edge for cross-segment tracks (highlighted).
     point_colors = [street_to_color.get(idx_to_name.get(i, UNASSIGNED_KEY),
                                         (0.6, 0.6, 0.6)) for i in idxs]
-    ax.scatter(xs, ys, c=point_colors, s=args.point_size,
-               edgecolors="white", linewidths=0.6, zorder=7)
+    is_cross = [ti["cross_segment"] for ti in track_info]
+
+    clean_x = [x for x, c in zip(xs, is_cross) if not c]
+    clean_y = [y for y, c in zip(ys, is_cross) if not c]
+    clean_col = [col for col, c in zip(point_colors, is_cross) if not c]
+
+    cross_x = [x for x, c in zip(xs, is_cross) if c]
+    cross_y = [y for y, c in zip(ys, is_cross) if c]
+    cross_col = [col for col, c in zip(point_colors, is_cross) if c]
+
+    if clean_x:
+        ax.scatter(clean_x, clean_y, c=clean_col, s=args.point_size,
+                   marker="o", edgecolors="white", linewidths=0.6, zorder=7)
+    if cross_x:
+        ax.scatter(cross_x, cross_y, c=cross_col, s=args.point_size * 1.6,
+                   marker="D", edgecolors="#d62728", linewidths=1.6,
+                   zorder=8, label="cross-segment")
 
     # Legend
     from collections import Counter

@@ -38,15 +38,22 @@ def sanitize(obj):
 
 
 def smooth_crowd_ids(tracks, window):
-    """Apply a per-track sliding-window mode filter on `crowd_id`.
+    """Segment-aware per-track sliding-window mode filter on `crowd_id`.
 
-    Reduces frame-to-frame identity flicker: within a window of ±window//2
-    frames around each sample, pick the most common non-null crowd_id,
-    tie-breaking in favour of the current value. Noise (crowd_id=None)
-    is ignored in the window vote.
+    Splits each track's timeline into runs of constant `street_index`, then
+    applies the mode filter INDEPENDENTLY within each run. Never smooths a
+    crowd_id across a segment boundary, so a genuine A→B polygon crossing is
+    preserved (crowd_id flips exactly at the boundary frame).
+
+    Returns (n_changed, n_transitions_preserved):
+      n_changed                = crowd_id values rewritten by in-segment smoothing
+      n_transitions_preserved  = count of street_index changes across all tracks
+                                 that were NOT masked by cross-run smoothing
+                                 (trivially all of them now that the filter is
+                                 segment-aware — reported for visibility).
     """
     if window <= 1:
-        return 0
+        return 0, 0
 
     timelines: dict[int, list[int]] = defaultdict(list)
     for idx, t in enumerate(tracks):
@@ -55,24 +62,44 @@ def smooth_crowd_ids(tracks, window):
 
     half = window // 2
     changed = 0
+    transitions_preserved = 0
+
     for tid, indices in timelines.items():
         indices.sort(key=lambda i: tracks[i]["frame_id"])
+        si_seq = [tracks[i].get("street_index") for i in indices]
         cids = [tracks[i].get("crowd_id") for i in indices]
         n = len(cids)
-        for j in range(n):
-            lo, hi = max(0, j - half), min(n, j + half + 1)
-            non_none = [c for c in cids[lo:hi] if c is not None]
-            if not non_none:
-                new = None
-            else:
-                counts = Counter(non_none).most_common()
-                top = counts[0][1]
-                tied = {c for c, k in counts if k == top}
-                new = cids[j] if cids[j] in tied else counts[0][0]
-            if new != cids[j]:
-                changed += 1
-                tracks[indices[j]]["crowd_id"] = new
-    return changed
+
+        # Split indices into contiguous runs of constant street_index
+        runs: list[tuple[int, int]] = []   # [(start, end_exclusive), ...]
+        run_start = 0
+        for j in range(1, n):
+            if si_seq[j] != si_seq[j - 1]:
+                runs.append((run_start, j))
+                transitions_preserved += 1
+                run_start = j
+        runs.append((run_start, n))
+
+        # Mode filter WITHIN each run only
+        for run_s, run_e in runs:
+            run_len = run_e - run_s
+            for j in range(run_s, run_e):
+                lo = max(run_s, j - half)
+                hi = min(run_e, j + half + 1)
+                window_cids = cids[lo:hi]
+                non_none = [c for c in window_cids if c is not None]
+                if not non_none:
+                    new = None
+                else:
+                    counts = Counter(non_none).most_common()
+                    top = counts[0][1]
+                    tied = {c for c, k in counts if k == top}
+                    new = cids[j] if cids[j] in tied else counts[0][0]
+                if new != cids[j]:
+                    changed += 1
+                    tracks[indices[j]]["crowd_id"] = new
+
+    return changed, transitions_preserved
 
 
 def main():
@@ -103,11 +130,13 @@ def main():
     tracks = data.get("tracks", data) if isinstance(data, dict) else data
 
     if args.smooth_window and args.smooth_window > 1:
-        print(f"Applying per-track mode filter, window={args.smooth_window}…")
-        changed = smooth_crowd_ids(tracks, args.smooth_window)
+        print(f"Applying segment-aware per-track mode filter, window={args.smooth_window}…")
+        changed, transitions_preserved = smooth_crowd_ids(tracks, args.smooth_window)
         total_person = sum(1 for t in tracks if t.get("class_name") == "person")
         pct = 100 * changed / max(total_person, 1)
-        print(f"  {changed}/{total_person} ({pct:.1f}%) crowd_id values updated")
+        print(f"  crowd_ids changed (within-segment mode filter) : {changed}/{total_person} "
+              f"({pct:.1f}%)")
+        print(f"  segment transitions preserved                   : {transitions_preserved}")
 
     frames: dict[int, dict] = {}
     max_frame = -1

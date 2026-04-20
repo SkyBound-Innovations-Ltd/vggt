@@ -140,6 +140,31 @@ def cluster_by_street(
     return n_used
 
 
+def _score_polygon_with_params(rows, params, fixed_params):
+    """Run one clustering pass on the polygon's rows with the given params and
+    return the LOCAL composite cost (unique_ids not street-normalised, since
+    we're scoring within a single polygon)."""
+    n_unique = len({t["track_id"] for t in rows})
+    for t in rows:
+        t["crowd_id"] = None
+    cluster_crowds_per_frame(
+        rows,
+        min_cluster_size=int(params["min_cluster_size"]),
+        min_samples=int(params["min_samples"]),
+        coherence_weight=float(params["coherence_weight"]),
+        cluster_selection_epsilon=float(params["cluster_selection_epsilon"]),
+        max_match_dist=float(params["max_match_dist"]),
+        ema_alpha=float(params["ema_alpha"]),
+        memory_frames=int(params["memory_frames"]),
+        max_cluster_population=fixed_params.get("max_cluster_population"),
+    )
+    metrics = compute_crowd_metrics(rows)
+    cost = crowd_composite_cost(metrics, n_unique)
+    for t in rows:
+        t["crowd_id"] = None
+    return cost
+
+
 def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params, label=""):
     """Random-search HDBSCAN params on a single polygon's person rows.
 
@@ -271,7 +296,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
 
 def build_metadata(tracks, best_params, best_cost, best_metrics, fps_hint,
                    street_index_map=None, bbox=None, osm_network_type=None,
-                   lateral_tol_m=None, polygon_stats=None, params_by_si=None):
+                   polygon_stats=None, params_by_si=None):
     uav = next((t for t in tracks if t.get("class_name") == "UAV"), None)
     home = None
     if uav is not None:
@@ -308,7 +333,6 @@ def build_metadata(tracks, best_params, best_cost, best_metrics, fps_hint,
             "enabled": True,
             "id_stride": ID_STRIDE,
             "network_type": osm_network_type,
-            "lateral_tol_m": lateral_tol_m,
             "bbox": list(bbox) if bbox is not None else None,
             "unassigned_key": UNASSIGNED_KEY,
             "snap_method": "per_frame_polygon_only",
@@ -373,11 +397,11 @@ def main():
     # Per-polygon autotune
     parser.add_argument("--no-per-polygon-autotune", action="store_true",
                         help="Skip the per-polygon autotune step after global autotune")
-    parser.add_argument("--min-tracks-per-polygon", type=int, default=30,
+    parser.add_argument("--min-tracks-per-polygon", type=int, default=10,
                         help="Polygons with fewer unique tracks than this use the global "
-                             "fallback params (default: 30)")
-    parser.add_argument("--per-polygon-n-iter", type=int, default=20,
-                        help="Max random-search iters per polygon (default: 20)")
+                             "fallback params (default: 10)")
+    parser.add_argument("--per-polygon-n-iter", type=int, default=25,
+                        help="Max random-search iters per polygon (default: 25)")
     parser.add_argument("--per-polygon-max-seconds", type=float, default=120.0,
                         help="Wall-clock budget per polygon (default: 120s)")
     args = parser.parse_args()
@@ -541,15 +565,21 @@ def main():
                     t["crowd_id"] = None
 
             by_si = _group_by_street(tracks)
+            report_rows = []  # (street_name, n_unique, cost_poly, cost_global, status)
             for si, rows in by_si.items():
                 street_name = next((k for k, v in street_index_map.items() if v == si),
                                    f"si={si}")
                 n_unique = len({t["track_id"] for t in rows})
+
+                # Cost of global params ON THIS polygon — fair comparison baseline
+                cost_global_on_poly = _score_polygon_with_params(rows, best_params, fixed)
+
                 if n_unique < args.min_tracks_per_polygon:
-                    params_by_si[si] = best_params  # fallback
-                    print(f"    [fallback] {street_name:<35s} tracks={n_unique:>4}  "
-                          f"(using global params)")
+                    params_by_si[si] = best_params
+                    report_rows.append((street_name, n_unique, None, cost_global_on_poly,
+                                        "(fallback: n_tracks<thresh)"))
                     continue
+
                 res = autotune_one_polygon(
                     rows, args.per_polygon_n_iter,
                     max_seconds=args.per_polygon_max_seconds,
@@ -557,10 +587,30 @@ def main():
                     fixed_params=fixed,
                     label=street_name,
                 )
-                if res is not None and res[1] is not None:
-                    params_by_si[si] = res[1]
-                else:
+                cost_poly = res[0] if (res is not None and res[1] is not None) else None
+                if cost_poly is None:
+                    # Autotune produced nothing usable — use global
                     params_by_si[si] = best_params
+                    report_rows.append((street_name, n_unique, None, cost_global_on_poly,
+                                        "(fallback: no result)"))
+                elif cost_poly > cost_global_on_poly:
+                    # Safety rail: random search found a worse combo — keep global
+                    params_by_si[si] = best_params
+                    report_rows.append((street_name, n_unique, cost_poly, cost_global_on_poly,
+                                        "(global better)"))
+                else:
+                    params_by_si[si] = res[1]
+                    report_rows.append((street_name, n_unique, cost_poly, cost_global_on_poly,
+                                        "polygon win"))
+
+            # Compact per-polygon cost report
+            print(f"\nper-polygon best cost vs global-fallback cost")
+            print(f"  {'street':<36s} {'n_tracks':>8s} {'cost_poly':>10s} "
+                  f"{'cost_global':>12s} {'Δ':>8s}  status")
+            for (name, n, cp, cg, status) in sorted(report_rows, key=lambda r: -r[1]):
+                cp_s = f"{cp:>10.2f}" if cp is not None else f"{'—':>10s}"
+                delta_s = f"{cp - cg:>+8.2f}" if cp is not None else f"{'—':>8s}"
+                print(f"  {name[:36]:<36s} {n:>8d} {cp_s} {cg:>12.2f} {delta_s}  {status}")
 
     print("\nRunning final clustering with best params ...")
     if partition_active:
@@ -621,7 +671,6 @@ def main():
         street_index_map=street_index_map,
         bbox=bbox,
         osm_network_type=None,
-        lateral_tol_m=None,
         polygon_stats=polygon_stats,
         params_by_si=params_by_si,
     )
