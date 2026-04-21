@@ -43,6 +43,26 @@
     }
     .pill { background: #f0f0f0; border-radius: 10px; padding: 2px 8px; font-size: 11px; }
     label { font-size: 13px; user-select: none; }
+    #eta-panel {
+      position: fixed; top: 12px; left: 12px; background: rgba(255,255,255,0.95);
+      padding: 10px 12px; border-radius: 6px; font-size: 13px; line-height: 1.4;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15); z-index: 1500;
+      display: flex; flex-direction: column; gap: 6px; min-width: 260px;
+    }
+    #eta-panel .row { display: flex; gap: 6px; align-items: center; }
+    #eta-panel input[type="number"] {
+      width: 100px; padding: 4px 6px; font-size: 13px;
+      border: 1px solid #999; border-radius: 3px;
+    }
+    #eta-panel button {
+      padding: 4px 10px; font-size: 13px; border: 1px solid #999; background: #fff;
+      border-radius: 3px; cursor: pointer;
+    }
+    #eta-panel button:hover:not(:disabled) { background: #f2f2f2; }
+    #eta-panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #eta-result { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+                  color: #222; min-height: 1.2em; }
+    #eta-result.err { color: #b31414; }
     #loader {
       position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
       background: rgba(255,255,255,0.85); font-size: 15px; color: #333; z-index: 1000;
@@ -51,6 +71,15 @@
 </head>
 <body>
   <div id="map"></div>
+  <div id="eta-panel">
+    <div style="font-weight:bold">ETA → Cardiff Central</div>
+    <div class="row">
+      <input id="eta-tid" type="number" min="0" placeholder="track_id" />
+      <button id="eta-go">Compute</button>
+      <button id="eta-clear" title="Clear path">✕</button>
+    </div>
+    <div id="eta-result">Pause the video, type a track_id, hit Compute.</div>
+  </div>
   <div id="legend"></div>
   <div id="tooltip"></div>
   <div id="controls">

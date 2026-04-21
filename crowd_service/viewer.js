@@ -151,6 +151,10 @@ async function init() {
   let playing = false;
   let lastTick = 0;
 
+  // ── ETA overlay state ─────────────────────────────────────────────
+  let etaState = null; // {track_id, eta_s, distance_m, path: [[lon,lat], ...],
+                       //  start: [lat,lon], station: [lat,lon], colorRgb}
+
   function setLegend(activeCrowdIds) {
     if (modeDensity.checked) {
       let html = '<b>Crowd density (p/m²)</b>';
@@ -319,6 +323,36 @@ async function init() {
       }));
     }
 
+    // ── ETA overlay (path + endpoints) ────────────────────────────
+    if (etaState) {
+      const { path, start, station, colorRgb } = etaState;
+      layers.push(new PathLayer({
+        id: 'eta-path',
+        data: [{ path }],
+        getPath: d => d.path,
+        getColor: [...colorRgb, 235],
+        getWidth: 4, widthUnits: 'pixels',
+        capRounded: true, jointRounded: true,
+        zorder: 20
+      }));
+      layers.push(new ScatterplotLayer({
+        id: 'eta-start',
+        data: [{ p: [start[1], start[0]] }],
+        getPosition: d => d.p,
+        getRadius: 6, radiusUnits: 'meters', radiusMinPixels: 7,
+        getFillColor: [...colorRgb, 255],
+        getLineColor: [255, 255, 255, 255], stroked: true, lineWidthMinPixels: 2
+      }));
+      layers.push(new ScatterplotLayer({
+        id: 'eta-station',
+        data: [{ p: [station[1], station[0]] }],
+        getPosition: d => d.p,
+        getRadius: 8, radiusUnits: 'meters', radiusMinPixels: 9,
+        getFillColor: [34, 139, 230, 255],
+        getLineColor: [255, 255, 255, 255], stroked: true, lineWidthMinPixels: 2
+      }));
+    }
+
     deckOverlay.setProps({ layers });
 
     const t = current / fpsSource;
@@ -359,6 +393,74 @@ async function init() {
   modeDensity.addEventListener('change', render);
   showArrows.addEventListener('change', render);
   showHulls.addEventListener('change', render);
+
+  // ── ETA panel ─────────────────────────────────────────────────────
+  const etaTid = document.getElementById('eta-tid');
+  const etaGo = document.getElementById('eta-go');
+  const etaClear = document.getElementById('eta-clear');
+  const etaResult = document.getElementById('eta-result');
+
+  async function computeETA() {
+    const tid = parseInt(etaTid.value, 10);
+    if (!Number.isFinite(tid)) {
+      etaResult.className = 'err';
+      etaResult.textContent = 'Enter a track_id.';
+      return;
+    }
+    etaGo.disabled = true;
+    etaResult.className = '';
+    etaResult.textContent = `Computing ETA for track ${tid} at frame ${current}…`;
+    try {
+      const r = await fetch('/api/eta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ frame_id: current, track_id: tid })
+      });
+      if (!r.ok) {
+        const detail = (await r.json().catch(() => ({}))).detail || r.statusText;
+        throw new Error(detail);
+      }
+      const resp = await r.json();
+      // Map crowd_id colour from the source track, falling back to station blue
+      const frame = frames[current];
+      const member = frame?.persons?.find(p => p.tid === tid);
+      const baseColor = member && member.cid != null ? crowdColor(member.cid, 255).slice(0, 3) : [220, 80, 40];
+      etaState = {
+        track_id: tid,
+        eta_s: resp.eta_s,
+        distance_m: resp.distance_m,
+        speed_mps: resp.speed_mps,
+        heading_deg: resp.heading_deg,
+        path: resp.path_geojson.coordinates,
+        start: resp.start_lat_lon,
+        station: resp.station_lat_lon,
+        stationLabel: resp.station_label,
+        colorRgb: baseColor
+      };
+      etaResult.innerHTML =
+        `Track <b>${tid}</b> → ${resp.station_label}<br>` +
+        `&nbsp;ETA&nbsp;<b>${resp.eta_s.toFixed(1)} s</b> · dist ${resp.distance_m.toFixed(0)} m · ` +
+        `speed ${resp.speed_mps.toFixed(2)} m/s` +
+        (resp.heading_deg != null ? ` · hdg ${resp.heading_deg.toFixed(0)}°` : '');
+      render();
+    } catch (err) {
+      etaState = null;
+      etaResult.className = 'err';
+      etaResult.textContent = `Error: ${err.message}`;
+      render();
+    } finally {
+      etaGo.disabled = false;
+    }
+  }
+
+  etaGo.addEventListener('click', computeETA);
+  etaTid.addEventListener('keydown', e => { if (e.key === 'Enter') computeETA(); });
+  etaClear.addEventListener('click', () => {
+    etaState = null;
+    etaResult.className = '';
+    etaResult.textContent = 'Pause the video, type a track_id, hit Compute.';
+    render();
+  });
 
   loader.remove();
   render();
