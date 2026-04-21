@@ -296,21 +296,31 @@ async function init() {
     }
 
     if (uav) {
-      // heading wedge as a short triangle
-      const hdg = (uav.heading ?? 0) * Math.PI / 180;
-      const r = 0.0004; // degrees (~40 m at this lat)
-      const wedge = [
-        [uav.lon, uav.lat],
-        [uav.lon + r * Math.sin(hdg + 0.5), uav.lat + r * Math.cos(hdg + 0.5)],
-        [uav.lon + r * Math.sin(hdg - 0.5), uav.lat + r * Math.cos(hdg - 0.5)],
-        [uav.lon, uav.lat]
-      ];
-      layers.push(new PathLayer({
-        id: 'uav-heading',
-        data: [{ path: wedge }],
-        getPath: d => d.path,
-        getColor: [220, 60, 60, 180],
-        getWidth: 1.5, widthUnits: 'pixels'
+      // ── Filled heading sector (pie slice) ────────────────────────
+      const hdgDeg = uav.heading ?? 0;
+      const SECTOR_HALF_ANGLE_DEG = 45;     // ±45° → 90° field-of-view cone
+      const SECTOR_RADIUS_DEG = 0.0008;      // ~80 m at Cardiff latitude
+      const ARC_STEPS = 24;
+      const ring = [[uav.lon, uav.lat]];
+      for (let i = 0; i <= ARC_STEPS; i++) {
+        const frac = i / ARC_STEPS;
+        const rel = -SECTOR_HALF_ANGLE_DEG + 2 * SECTOR_HALF_ANGLE_DEG * frac;
+        const theta = (hdgDeg + rel) * Math.PI / 180;  // heading+offset, 0=N
+        ring.push([
+          uav.lon + SECTOR_RADIUS_DEG * Math.sin(theta),
+          uav.lat + SECTOR_RADIUS_DEG * Math.cos(theta)
+        ]);
+      }
+      ring.push([uav.lon, uav.lat]);
+      layers.push(new deck.PolygonLayer({
+        id: 'uav-heading-fill',
+        data: [{ polygon: ring }],
+        getPolygon: d => d.polygon,
+        getFillColor: [220, 60, 60, 60],     // translucent red
+        getLineColor: [220, 60, 60, 220],
+        getLineWidth: 1.5, lineWidthUnits: 'pixels',
+        stroked: true, filled: true,
+        zorder: 4
       }));
       layers.push(new ScatterplotLayer({
         id: 'uav',
@@ -324,17 +334,33 @@ async function init() {
       }));
     }
 
-    // ── ETA overlay (path + endpoints) ────────────────────────────
+    // ── ETA overlay: halo + coloured path + end-point markers ─────
     if (etaState) {
       const { path, start, station, colorRgb } = etaState;
+      // Halo (white, wider) drawn first so the coloured path reads on top
+      layers.push(new PathLayer({
+        id: 'eta-path-halo',
+        data: [{ path }],
+        getPath: d => d.path,
+        getColor: [255, 255, 255, 220],
+        getWidth: 11, widthUnits: 'pixels',
+        capRounded: true, jointRounded: true,
+      }));
       layers.push(new PathLayer({
         id: 'eta-path',
         data: [{ path }],
         getPath: d => d.path,
-        getColor: [...colorRgb, 235],
-        getWidth: 4, widthUnits: 'pixels',
+        getColor: [...colorRgb, 255],
+        getWidth: 6, widthUnits: 'pixels',
         capRounded: true, jointRounded: true,
-        zorder: 20
+      }));
+      // Start marker: filled crowd colour with white ring
+      layers.push(new ScatterplotLayer({
+        id: 'eta-start-halo',
+        data: [{ p: [start[1], start[0]] }],
+        getPosition: d => d.p,
+        getRadius: 10, radiusUnits: 'meters', radiusMinPixels: 11,
+        getFillColor: [255, 255, 255, 255],
       }));
       layers.push(new ScatterplotLayer({
         id: 'eta-start',
@@ -342,16 +368,40 @@ async function init() {
         getPosition: d => d.p,
         getRadius: 6, radiusUnits: 'meters', radiusMinPixels: 7,
         getFillColor: [...colorRgb, 255],
-        getLineColor: [255, 255, 255, 255], stroked: true, lineWidthMinPixels: 2
+      }));
+      // Station marker: blue "depot" dot with label
+      layers.push(new ScatterplotLayer({
+        id: 'eta-station-halo',
+        data: [{ p: [station[1], station[0]] }],
+        getPosition: d => d.p,
+        getRadius: 14, radiusUnits: 'meters', radiusMinPixels: 15,
+        getFillColor: [255, 255, 255, 255],
       }));
       layers.push(new ScatterplotLayer({
         id: 'eta-station',
         data: [{ p: [station[1], station[0]] }],
         getPosition: d => d.p,
-        getRadius: 8, radiusUnits: 'meters', radiusMinPixels: 9,
-        getFillColor: [34, 139, 230, 255],
-        getLineColor: [255, 255, 255, 255], stroked: true, lineWidthMinPixels: 2
+        getRadius: 9, radiusUnits: 'meters', radiusMinPixels: 10,
+        getFillColor: [34, 110, 210, 255],
       }));
+      if (deck.TextLayer) {
+        layers.push(new deck.TextLayer({
+          id: 'eta-station-label',
+          data: [{ p: [station[1], station[0]], text: etaState.stationLabel || 'Cardiff Central' }],
+          getPosition: d => d.p,
+          getText: d => d.text,
+          getSize: 13, getColor: [20, 20, 20, 255],
+          getPixelOffset: [0, -22],
+          fontWeight: 600,
+          background: true,
+          backgroundPadding: [4, 2],
+          getBackgroundColor: [255, 255, 255, 230],
+          getBorderColor: [20, 20, 20, 120],
+          getBorderWidth: 1,
+          outlineColor: [255, 255, 255, 255],
+          outlineWidth: 2,
+        }));
+      }
     }
 
     deckOverlay.setProps({ layers });
