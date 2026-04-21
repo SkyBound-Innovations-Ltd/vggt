@@ -51,7 +51,7 @@ DATASETS: dict[str, Path] = {
 }
 DEFAULT_DATASET = "cardiff_20260416"
 
-STATION_LATLON = (51.47640, -3.17940)        # Cardiff Central Station
+STATION_LATLON = (51.47596121244687, -3.1790395677356105)  # Cardiff Central Station
 STATION_LABEL = "Cardiff Central"
 CONE_DEG = 90.0                               # ±90°
 SPEED_FLOOR_MPS = 0.5

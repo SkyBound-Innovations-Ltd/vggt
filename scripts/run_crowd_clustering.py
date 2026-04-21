@@ -112,11 +112,12 @@ def cluster_by_street(
     for si, rows in by_si.items():
         if not rows:
             continue
+        # Tracks outside every polygon are intentionally NOT clustered — crowd
+        # identity only applies within a street. Their crowd_id stays None.
+        if si == unassigned_si:
+            continue
 
         p = dict((params_by_si or {}).get(si, params))
-        if si == unassigned_si and unassigned_relaxed:
-            p["min_cluster_size"] = max(3, int(p["min_cluster_size"]) // 2 + 1)
-            p["cluster_selection_epsilon"] = max(float(p["cluster_selection_epsilon"]), 1.0)
         # HDBSCAN requires min_samples <= min_cluster_size (and <= available samples).
         # Clamp defensively to prevent errors on sparse per-frame buckets.
         p["min_samples"] = min(int(p["min_samples"]), int(p["min_cluster_size"]))
@@ -558,8 +559,11 @@ def main():
             # Invalidate any clustering state left behind by autotune
             _clear_crowd_ids(_iter_persons(tracks))
             by_si = _group_by_street(tracks)
+            unassigned_si = street_index_map.get(UNASSIGNED_KEY, 0)
             report_rows = []  # (street_name, n_unique, cost_poly, cost_global, status)
             for si, rows in by_si.items():
+                if si == unassigned_si:
+                    continue  # unassigned tracks don't form crowds
                 street_name = next((k for k, v in street_index_map.items() if v == si),
                                    f"si={si}")
                 n_unique = len({t["track_id"] for t in rows})
