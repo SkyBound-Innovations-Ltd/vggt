@@ -74,9 +74,10 @@ async function loadFrames(url) {
 
 async function init() {
   const loader = document.getElementById('loader');
-  loader.textContent = 'Loading frames.json…';
+  const FRAMES_URL = 'frames_20260416.json';  // Cardiff-2 default
+  loader.textContent = `Loading ${FRAMES_URL}…`;
 
-  const data = await loadFrames('frames.json');
+  const data = await loadFrames(FRAMES_URL);
   const { metadata, frames } = data;
   const total = frames.length;
   const fpsSource = metadata.fps || 24;
