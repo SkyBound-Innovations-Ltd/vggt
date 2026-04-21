@@ -70,12 +70,20 @@ PARAM_GRID = {
 ID_STRIDE = 10_000  # crowd_id = street_index * ID_STRIDE + local_id
 
 
+def _clear_crowd_ids(rows):
+    """Reset crowd_id to None on each row. Accepts any iterable of dicts."""
+    for t in rows:
+        t["crowd_id"] = None
+
+
+def _iter_persons(tracks):
+    return (t for t in tracks if t.get("class_name") == "person")
+
+
 def _group_by_street(tracks):
     """Return dict[street_index -> list[person_row_ref]]. Ignores non-person rows."""
     by_si = defaultdict(list)
-    for t in tracks:
-        if t.get("class_name") != "person":
-            continue
+    for t in _iter_persons(tracks):
         by_si[t.get("street_index", 0)].append(t)
     return by_si
 
@@ -96,10 +104,7 @@ def cluster_by_street(
     per-street mapping {street_index: param_dict} that overrides `params`
     for specific streets.
     """
-    for t in tracks:
-        if t.get("class_name") == "person":
-            t["crowd_id"] = None
-
+    _clear_crowd_ids(_iter_persons(tracks))
     by_si = _group_by_street(tracks)
     unassigned_si = street_index_map.get(UNASSIGNED_KEY, 0)
     n_used = 0
@@ -145,8 +150,7 @@ def _score_polygon_with_params(rows, params, fixed_params):
     return the LOCAL composite cost (unique_ids not street-normalised, since
     we're scoring within a single polygon)."""
     n_unique = len({t["track_id"] for t in rows})
-    for t in rows:
-        t["crowd_id"] = None
+    _clear_crowd_ids(rows)
     cluster_crowds_per_frame(
         rows,
         min_cluster_size=int(params["min_cluster_size"]),
@@ -160,8 +164,7 @@ def _score_polygon_with_params(rows, params, fixed_params):
     )
     metrics = compute_crowd_metrics(rows)
     cost = crowd_composite_cost(metrics, n_unique)
-    for t in rows:
-        t["crowd_id"] = None
+    _clear_crowd_ids(rows)
     return cost
 
 
@@ -185,9 +188,7 @@ def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params, label=""
         combo = {k: PARAM_GRID[k][rng.randint(len(PARAM_GRID[k]))] for k in keys}
         params = {**fixed_params, **combo}
 
-        for t in rows:
-            t["crowd_id"] = None
-
+        _clear_crowd_ids(rows)
         cluster_crowds_per_frame(
             rows,
             min_cluster_size=int(params["min_cluster_size"]),
@@ -204,8 +205,7 @@ def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params, label=""
         if cost < best[0]:
             best = (cost, combo.copy(), metrics.copy())
 
-    for t in rows:
-        t["crowd_id"] = None
+    _clear_crowd_ids(rows)
 
     if label:
         bcost, bp, bm = best
@@ -260,9 +260,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
             metrics = compute_crowd_metrics(tracks)
             cost = _cost_street_aware(metrics, n_unique, n_streets)
         else:
-            for t in tracks:
-                if t.get("class_name") == "person":
-                    t["crowd_id"] = None
+            _clear_crowd_ids(_iter_persons(tracks))
             cluster_crowds_per_frame(
                 tracks,
                 min_cluster_size=int(params["min_cluster_size"]),
@@ -287,9 +285,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
         if cost < best[0]:
             best = (cost, combo.copy(), metrics.copy())
 
-    for t in tracks:
-        if t.get("class_name") == "person":
-            t["crowd_id"] = None
+    _clear_crowd_ids(_iter_persons(tracks))
 
     return best
 
@@ -560,10 +556,7 @@ def main():
             print(f"\nPer-polygon autotune (min_tracks={args.min_tracks_per_polygon}, "
                   f"n_iter={args.per_polygon_n_iter})")
             # Invalidate any clustering state left behind by autotune
-            for t in tracks:
-                if t.get("class_name") == "person":
-                    t["crowd_id"] = None
-
+            _clear_crowd_ids(_iter_persons(tracks))
             by_si = _group_by_street(tracks)
             report_rows = []  # (street_name, n_unique, cost_poly, cost_global, status)
             for si, rows in by_si.items():

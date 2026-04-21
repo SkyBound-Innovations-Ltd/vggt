@@ -32,10 +32,11 @@ import pandas as pd
 import pyproj
 from shapely.geometry import Point
 
+from collections import Counter, defaultdict
+
 from osm_streets import (
     UNASSIGNED_KEY,
     compute_bbox,
-    compute_track_medians,
     fetch_named_pedestrian_polygons,
     load_user_polygons,
 )
@@ -107,13 +108,10 @@ def main():
     street_to_color = {name: pal[i] for i, name in enumerate(street_names)}
     street_to_color[UNASSIGNED_KEY] = (0.6, 0.6, 0.6)
 
-    # ── Project polygons + per-track dominant-polygon coords ────────────
     polys_wm = polys.to_crs(epsg=3857)
 
     DOMINANT_THRESH = 0.80  # residency cut-off for "cleanly in polygon"
 
-    # Build per-track: list of (frame_id, street_index, lat, lon)
-    from collections import Counter, defaultdict
     track_frames: dict[int, list[tuple]] = defaultdict(list)
     for t in tracks:
         if t.get("class_name") != "person":
@@ -124,12 +122,7 @@ def main():
             continue
         track_frames[t["track_id"]].append((float(lat), float(lon), int(si)))
 
-    # For each track: dominant polygon (mode of si), residency, median of
-    # frames INSIDE the dominant polygon (fall back to all-frame median when
-    # dominant-polygon frames < 3)
-    track_info: list[dict] = []  # each dict → tid, dominant_si, frac_dom,
-                                 #              frac_2nd, si_2nd, lat, lon,
-                                 #              cross_segment
+    track_info: list[dict] = []
     for tid, frames_list in track_frames.items():
         n = len(frames_list)
         if n == 0:
@@ -227,30 +220,12 @@ def main():
             bbox=dict(boxstyle="round,pad=0.18", fc=(1, 1, 1, 0.85), ec="black", lw=0.5),
         )
 
-    # Track medians — split by residency flag: circles for clean tracks,
-    # diamonds with red edge for cross-segment tracks (highlighted).
     point_colors = [street_to_color.get(idx_to_name.get(i, UNASSIGNED_KEY),
                                         (0.6, 0.6, 0.6)) for i in idxs]
-    is_cross = [ti["cross_segment"] for ti in track_info]
-
-    clean_x = [x for x, c in zip(xs, is_cross) if not c]
-    clean_y = [y for y, c in zip(ys, is_cross) if not c]
-    clean_col = [col for col, c in zip(point_colors, is_cross) if not c]
-
-    cross_x = [x for x, c in zip(xs, is_cross) if c]
-    cross_y = [y for y, c in zip(ys, is_cross) if c]
-    cross_col = [col for col, c in zip(point_colors, is_cross) if c]
-
-    if clean_x:
-        ax.scatter(clean_x, clean_y, c=clean_col, s=args.point_size,
-                   marker="o", edgecolors="white", linewidths=0.6, zorder=7)
-    if cross_x:
-        ax.scatter(cross_x, cross_y, c=cross_col, s=args.point_size * 1.6,
-                   marker="D", edgecolors="#d62728", linewidths=1.6,
-                   zorder=8, label="cross-segment")
+    ax.scatter(xs, ys, c=point_colors, s=args.point_size,
+               edgecolors="white", linewidths=0.6, zorder=7)
 
     # Legend
-    from collections import Counter
     counts = Counter(idxs)
     top = [(idx_to_name.get(i, UNASSIGNED_KEY), counts[i])
            for i, _ in counts.most_common(16)]

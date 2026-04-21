@@ -55,6 +55,8 @@ def smooth_crowd_ids(tracks, window):
     if window <= 1:
         return 0, 0
 
+    from itertools import groupby
+
     timelines: dict[int, list[int]] = defaultdict(list)
     for idx, t in enumerate(tracks):
         if t.get("class_name") == "person":
@@ -68,26 +70,20 @@ def smooth_crowd_ids(tracks, window):
         indices.sort(key=lambda i: tracks[i]["frame_id"])
         si_seq = [tracks[i].get("street_index") for i in indices]
         cids = [tracks[i].get("crowd_id") for i in indices]
-        n = len(cids)
 
-        # Split indices into contiguous runs of constant street_index
-        runs: list[tuple[int, int]] = []   # [(start, end_exclusive), ...]
-        run_start = 0
-        for j in range(1, n):
-            if si_seq[j] != si_seq[j - 1]:
-                runs.append((run_start, j))
-                transitions_preserved += 1
-                run_start = j
-        runs.append((run_start, n))
+        pos = 0
+        runs: list[tuple[int, int]] = []
+        for _, group in groupby(si_seq):
+            run_len = sum(1 for _ in group)
+            runs.append((pos, pos + run_len))
+            pos += run_len
+        transitions_preserved += max(0, len(runs) - 1)
 
-        # Mode filter WITHIN each run only
         for run_s, run_e in runs:
-            run_len = run_e - run_s
             for j in range(run_s, run_e):
                 lo = max(run_s, j - half)
                 hi = min(run_e, j + half + 1)
-                window_cids = cids[lo:hi]
-                non_none = [c for c in window_cids if c is not None]
+                non_none = [c for c in cids[lo:hi] if c is not None]
                 if not non_none:
                     new = None
                 else:
