@@ -631,6 +631,15 @@ def main():
             max_cluster_population=fixed.get("max_cluster_population"),
         )
 
+    # Per-person crowd_density via Voronoi tessellation (populates the
+    # `crowd_density` field that later flows into frames.json as `cd`).
+    try:
+        from density import compute_crowd_density_voronoi
+        n_density = compute_crowd_density_voronoi(tracks)
+        print(f"\nVoronoi crowd_density: {n_density} person-rows annotated")
+    except ImportError:
+        print("\nVoronoi density module not found; skipping crowd_density")
+
     final_metrics = compute_crowd_metrics(tracks)
     if partition_active:
         # Count non-empty street buckets for cost normalisation
