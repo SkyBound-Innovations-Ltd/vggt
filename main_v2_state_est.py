@@ -1333,6 +1333,7 @@ def cluster_crowds_per_frame(
     ema_alpha: float = 0.7,
     memory_frames: int = 30,
     max_cluster_population: Optional[int] = None,
+    feature_mode: str = "pos_vel",
 ) -> None:
     """
     Apply temporally-stable HDBSCAN crowd clustering to person detections.
@@ -1443,8 +1444,16 @@ def cluster_crowds_per_frame(
         vel_std = np.maximum(velocities.std(axis=0), _STD_FLOOR)
         vel_z = (velocities - vel_mean) / vel_std
 
-        # Build 4D feature: [z(pos), coherence_weight * z(vel)]
-        features = np.hstack([pos_z, vel_z * coherence_weight])
+        # Build feature vector per `feature_mode`:
+        #   "pos_vel"  : 4D = [z(pos_N), z(pos_E), cw·z(vel_N), cw·z(vel_E)]
+        #   "vel_only" : 2D = [cw·z(vel_N), cw·z(vel_E)]
+        # The "vel_only" path lets a caller opt out of spatial subdivision
+        # within a polygon so crowds form only by direction of motion
+        # (e.g. opposing pedestrian flows on the same street).
+        if feature_mode == "vel_only":
+            features = vel_z * coherence_weight
+        else:
+            features = np.hstack([pos_z, vel_z * coherence_weight])
 
         norm_stats = (pos_mean, pos_std, vel_mean, vel_std)
 

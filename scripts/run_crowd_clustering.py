@@ -97,6 +97,7 @@ def cluster_by_street(
     id_stride=ID_STRIDE,
     unassigned_relaxed=True,
     params_by_si: Optional[dict] = None,
+    feature_mode: str = "pos_vel",
 ):
     """Run cluster_crowds_per_frame once per street bucket, then offset ids.
 
@@ -132,6 +133,7 @@ def cluster_by_street(
             ema_alpha=float(p["ema_alpha"]),
             memory_frames=int(p["memory_frames"]),
             max_cluster_population=max_cluster_population,
+            feature_mode=feature_mode,
         )
 
         any_clustered = False
@@ -146,7 +148,7 @@ def cluster_by_street(
     return n_used
 
 
-def _score_polygon_with_params(rows, params, fixed_params):
+def _score_polygon_with_params(rows, params, fixed_params, feature_mode="pos_vel"):
     """Run one clustering pass on the polygon's rows with the given params and
     return the LOCAL composite cost (unique_ids not street-normalised, since
     we're scoring within a single polygon)."""
@@ -162,6 +164,7 @@ def _score_polygon_with_params(rows, params, fixed_params):
         ema_alpha=float(params["ema_alpha"]),
         memory_frames=int(params["memory_frames"]),
         max_cluster_population=fixed_params.get("max_cluster_population"),
+        feature_mode=feature_mode,
     )
     metrics = compute_crowd_metrics(rows)
     cost = crowd_composite_cost(metrics, n_unique)
@@ -169,7 +172,8 @@ def _score_polygon_with_params(rows, params, fixed_params):
     return cost
 
 
-def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params, label=""):
+def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params,
+                         label="", feature_mode="pos_vel"):
     """Random-search HDBSCAN params on a single polygon's person rows.
 
     Returns (best_cost, best_params, best_metrics) or None if there aren't
@@ -200,6 +204,7 @@ def autotune_one_polygon(rows, n_iter, max_seconds, seed, fixed_params, label=""
             ema_alpha=float(params["ema_alpha"]),
             memory_frames=int(params["memory_frames"]),
             max_cluster_population=fixed_params.get("max_cluster_population"),
+            feature_mode=feature_mode,
         )
         metrics = compute_crowd_metrics(rows)
         cost = crowd_composite_cost(metrics, n_unique)
@@ -233,7 +238,7 @@ def _cost_street_aware(metrics, n_tracks, n_streets):
 
 
 def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
-             street_index_map=None):
+             street_index_map=None, feature_mode="pos_vel"):
     n_unique = len(set(
         t["track_id"] for t in tracks
         if t.get("class_name") == "person" and t.get("pos_ned") is not None
@@ -257,6 +262,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
                 tracks, params,
                 max_cluster_population=fixed_params.get("max_cluster_population"),
                 street_index_map=street_index_map,
+                feature_mode=feature_mode,
             )
             metrics = compute_crowd_metrics(tracks)
             cost = _cost_street_aware(metrics, n_unique, n_streets)
@@ -272,6 +278,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
                 ema_alpha=float(params["ema_alpha"]),
                 memory_frames=int(params["memory_frames"]),
                 max_cluster_population=fixed_params.get("max_cluster_population"),
+                feature_mode=feature_mode,
             )
             metrics = compute_crowd_metrics(tracks)
             cost = crowd_composite_cost(metrics, n_unique)
@@ -293,7 +300,7 @@ def autotune(tracks, n_iter, max_seconds, seed, fixed_params,
 
 def build_metadata(tracks, best_params, best_cost, best_metrics, fps_hint,
                    street_index_map=None, bbox=None, osm_network_type=None,
-                   polygon_stats=None, params_by_si=None):
+                   polygon_stats=None, params_by_si=None, feature_mode="pos_vel"):
     uav = next((t for t in tracks if t.get("class_name") == "UAV"), None)
     home = None
     if uav is not None:
@@ -312,14 +319,15 @@ def build_metadata(tracks, best_params, best_cost, best_metrics, fps_hint,
     crowd_meta = {
         "method": "HDBSCAN_per_frame_hungarian",
         "z_score_normalisation": True,
+        "feature_mode": feature_mode,
         "auto_tuned": cost_val is not None,
         "tuning_best_cost": cost_val,
         "tuning_metrics": {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                            for k, v in (best_metrics or {}).items()},
-        "note": "Per-frame HDBSCAN with z-score normalised features (pos_N, pos_E, "
-                "coherence_weight * vel_N, coherence_weight * vel_E), Hungarian "
-                "centroid matching, EMA smoothing, and multi-frame memory for "
-                "stable crowd IDs.",
+        "note": ("Per-frame HDBSCAN with z-score normalised features "
+                 "([z(pos), cw*z(vel)] if feature_mode=pos_vel else "
+                 "[cw*z(vel)] only), Hungarian centroid matching, EMA "
+                 "smoothing, and multi-frame memory for stable crowd IDs."),
     }
     if best_params:
         crowd_meta.update({k: (float(v) if isinstance(v, (np.floating, float)) else int(v))
@@ -401,6 +409,13 @@ def main():
                         help="Max random-search iters per polygon (default: 25)")
     parser.add_argument("--per-polygon-max-seconds", type=float, default=120.0,
                         help="Wall-clock budget per polygon (default: 120s)")
+    # Feature mode (option B): what goes into the HDBSCAN feature vector
+    parser.add_argument("--feature-mode", choices=["pos_vel", "vel_only"],
+                        default="pos_vel",
+                        help="HDBSCAN feature vector: 'pos_vel' uses [z(pos), "
+                             "cw*z(vel)] (default, spatial + velocity); 'vel_only' "
+                             "uses [cw*z(vel)] so crowds within a polygon form "
+                             "only by direction of motion (e.g. opposing flows).")
     args = parser.parse_args()
 
     in_path = Path(args.input)
@@ -547,6 +562,7 @@ def main():
         best_cost, best_params, best_metrics = autotune(
             tracks, args.n_iter, args.max_seconds, args.seed, fixed,
             street_index_map=street_index_map,
+            feature_mode=args.feature_mode,
         )
         print(f"\nGlobal autotune best cost: {best_cost:.2f}")
         for k, v in best_params.items():
@@ -569,7 +585,9 @@ def main():
                 n_unique = len({t["track_id"] for t in rows})
 
                 # Cost of global params ON THIS polygon — fair comparison baseline
-                cost_global_on_poly = _score_polygon_with_params(rows, best_params, fixed)
+                cost_global_on_poly = _score_polygon_with_params(
+                    rows, best_params, fixed, feature_mode=args.feature_mode
+                )
 
                 if n_unique < args.min_tracks_per_polygon:
                     params_by_si[si] = best_params
@@ -583,6 +601,7 @@ def main():
                     seed=args.seed + si,
                     fixed_params=fixed,
                     label=street_name,
+                    feature_mode=args.feature_mode,
                 )
                 cost_poly = res[0] if (res is not None and res[1] is not None) else None
                 if cost_poly is None:
@@ -616,6 +635,7 @@ def main():
             max_cluster_population=fixed.get("max_cluster_population"),
             street_index_map=street_index_map,
             params_by_si=params_by_si or None,
+            feature_mode=args.feature_mode,
         )
         print(f"  Streets used: {n_streets_used}/{len(street_index_map)}")
     else:
@@ -629,6 +649,7 @@ def main():
             ema_alpha=float(best_params["ema_alpha"]),
             memory_frames=int(best_params["memory_frames"]),
             max_cluster_population=fixed.get("max_cluster_population"),
+            feature_mode=args.feature_mode,
         )
 
     # Per-person crowd_density via Voronoi tessellation (populates the
@@ -679,6 +700,7 @@ def main():
         osm_network_type=None,
         polygon_stats=polygon_stats,
         params_by_si=params_by_si,
+        feature_mode=args.feature_mode,
     )
 
     out = {"metadata": metadata, "tracks": tracks}
